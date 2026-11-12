@@ -1,0 +1,5 @@
+# Netlify Function dependencies (installed by Netlify at build time).
+# fastapi matches the version verified on the Hugging Face staging.
+# mangum adapts the FastAPI ASGI app to AWS Lambda / Netlify Functions.
+fastapi==0.162.5
+mangum==0.22.0
