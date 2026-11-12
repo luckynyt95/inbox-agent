@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inbox Agent — your inbox, done by agents</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 45%, #f093fb 100%);
+    background-attachment: fixed;
+    color: #1f2937; min-height: 100vh; padding: 24px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { text-align: center; color: #fff; margin-bottom: 22px; animation: drop 0.6s ease both; }
+  header h1 { font-size: 2.4rem; letter-spacing: -1px; }
+  header h1 span { background: linear-gradient(90deg,#fde68a,#fca5a5,#93c5fd); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  header p { opacity: .92; margin-top: 6px; }
+  @keyframes drop { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: none; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+  .card { background: #fff; border-radius: 18px; padding: 20px; margin-bottom: 18px;
+          box-shadow: 0 10px 30px rgba(0,0,0,.18); animation: rise .5s ease both; }
+  .counts { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .count { border-radius: 14px; padding: 14px 8px; text-align: center; color: #fff; transition: transform .2s; cursor: pointer; }
+  .count:hover { transform: translateY(-4px) scale(1.03); }
+  .count b { font-size: 2rem; display: block; }
+  .count span { font-size: .85rem; opacity: .95; }
+  .c-urgent { background: linear-gradient(135deg,#ef4444,#f97316); }
+  .c-action { background: linear-gradient(135deg,#f59e0b,#eab308); }
+  .c-fyi    { background: linear-gradient(135deg,#3b82f6,#06b6d4); }
+  .c-promo  { background: linear-gradient(135deg,#8b5cf6,#ec4899); }
+  .c-spam   { background: linear-gradient(135deg,#6b7280,#374151); }
+  .needs { border-left: 8px solid #ef4444; }
+  .needs h2 { color: #dc2626; margin-bottom: 10px; }
+  .need-item { background: #fef2f2; border: 1px solid #fecaca; border-radius: 12px;
+               padding: 12px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .75rem; font-weight: 700; color: #fff; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .filters button { border: none; padding: 8px 16px; border-radius: 999px; font-weight: 600;
+                    cursor: pointer; background: #e5e7eb; color: #374151; transition: all .2s; }
+  .filters button.active { background: #111827; color: #fff; transform: scale(1.05); }
+  .email { border: 1px solid #e5e7eb; border-radius: 14px; padding: 14px; margin-bottom: 10px;
+           cursor: pointer; transition: box-shadow .2s, transform .2s; animation: rise .4s ease both; background: #fff; }
+  .email:hover { box-shadow: 0 6px 18px rgba(0,0,0,.12); transform: translateY(-2px); }
+  .email .top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+  .email .subj { font-weight: 700; }
+  .email .meta { color: #6b7280; font-size: .85rem; margin-top: 2px; }
+  .email .reason { font-size: .88rem; color: #4b5563; margin-top: 6px; }
+  .detail { display: none; margin-top: 12px; border-top: 1px dashed #d1d5db; padding-top: 12px; }
+  .email.open .detail { display: block; animation: rise .3s ease both; }
+  .detail pre { white-space: pre-wrap; font-family: inherit; background: #f9fafb; border-radius: 10px; padding: 12px; font-size: .92rem; }
+  .draft-box { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 12px; margin-top: 10px; }
+  .draft-box pre { background: transparent; padding: 0; }
+  .btn { border: none; padding: 8px 16px; border-radius: 999px; font-weight: 700; cursor: pointer; margin: 6px 6px 0 0; transition: transform .15s; }
+  .btn:hover { transform: scale(1.05); }
+  .btn-approve { background: #16a34a; color: #fff; }
+  .btn-edit { background: #f59e0b; color: #fff; }
+  .btn-run { background: #fff; color: #7c3aed; font-size: 1rem; padding: 12px 26px; box-shadow: 0 6px 18px rgba(0,0,0,.2); }
+  .approved-tag { color: #16a34a; font-weight: 700; }
+  .task { display: flex; justify-content: space-between; gap: 10px; padding: 10px 4px; border-bottom: 1px solid #f3f4f6; }
+  .task:last-child { border-bottom: none; }
+  .due { font-weight: 700; color: #dc2626; white-space: nowrap; }
+  .estimate { background: linear-gradient(135deg,#10b981,#06b6d4); color: #fff; text-align: center; }
+  .estimate b { font-size: 2rem; }
+  .estimate small { opacity: .9; display: block; margin-top: 4px; line-height: 1.4; }
+  .mode { text-align: center; color: #fff; opacity: .9; font-size: .9rem; margin-top: 4px; }
+  .center { text-align: center; margin-bottom: 16px; }
+  @media (max-width: 640px) { .counts { grid-template-columns: repeat(2, 1fr); } header h1 { font-size: 1.8rem; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📬 Inbox <span>Agent</span></h1>
+    <p>Five agents read your inbox, sort it, draft replies and pull out tasks — you only touch the urgent stuff.</p>
+  </header>
+
+  <div class="center"><button class="btn btn-run" onclick="runPipeline()">▶ Run the agents</button></div>
+  <div class="mode" id="mode">Loading…</div>
+
+  <div class="card">
+    <div class="counts" id="counts"></div>
+  </div>
+
+  <div class="card estimate">
+    <b id="saved">~0 min</b>
+    <small>ESTIMATE — time saved on this inbox. Assumes about 3 minutes per email to read, sort and reply by hand (20 emails ≈ 60 min). The agents did it in seconds. Demo estimate only, not a measured fact.</small>
+  </div>
+
+  <div class="card needs">
+    <h2>🚨 Needs you now</h2>
+    <div id="needs"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-bottom:12px">📥 Triaged inbox <span style="font-weight:400;font-size:.85rem;color:#6b7280">(click an email to see the original, the agent's reason and its draft)</span></h2>
+    <div class="filters" id="filters"></div>
+    <div id="emails"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-bottom:8px">✅ Tasks found <span id="taskCount"></span></h2>
+    <div id="tasks"></div>
+  </div>
+
+  <p style="text-align:center;color:#fff;opacity:.85;font-size:.85rem">Demo data only — this inbox is fictional. Drafts are drafts: nothing is ever sent, deleted or trashed.</p>
+</div>
+
+<script>
+const CAT_COLORS = { urgent: '#ef4444', action: '#f59e0b', fyi: '#3b82f6', promo: '#8b5cf6', spam: '#6b7280' };
+const CAT_LABELS = { urgent: 'Urgent', action: 'Action needed', fyi: 'FYI', promo: 'Promo', spam: 'Spam' };
+let allEmails = [], currentFilter = '';
+
+function animateCount(el, target) {
+  let n = 0; const step = Math.max(1, Math.round(target / 20));
+  const t = setInterval(() => { n += step; if (n >= target) { n = target; clearInterval(t); } el.textContent = n; }, 30);
+}
+
+async function loadAll() {
+  const [st, em, tk] = await Promise.all([
+    fetch('/api/status').then(r => r.json()),
+    fetch('/api/emails').then(r => r.json()),
+    fetch('/api/tasks').then(r => r.json()),
+  ]);
+  document.getElementById('mode').textContent =
+    'Engine: ' + st.engine + '  •  Last run: ' + (st.last_run_seconds ?? '?') + 's  •  ' + st.note;
+  allEmails = em.emails;
+  renderCounts(em.counts);
+  renderNeeds(allEmails.filter(e => e.category === 'urgent'));
+  renderFilters(em.counts);
+  renderEmails();
+  renderTasks(tk.tasks);
+  // Time-saved estimate: 3 min/email by hand minus agent seconds.
+  const manualMin = allEmails.length * 3;
+  const saved = Math.max(0, Math.round(manualMin - (st.last_run_seconds || 0) / 60));
+  document.getElementById('saved').textContent = '~' + saved + ' min saved';
+}
+
+function renderCounts(counts) {
+  const box = document.getElementById('counts');
+  box.innerHTML = '';
+  for (const [cat, n] of Object.entries(counts)) {
+    const d = document.createElement('div');
+    d.className = 'count c-' + cat;
+    d.innerHTML = `<b>0</b><span>${CAT_LABELS[cat]}</span>`;
+    d.onclick = () => { currentFilter = currentFilter === cat ? '' : cat; renderFilters(counts); renderEmails(); };
+    box.appendChild(d);
+    animateCount(d.querySelector('b'), n);
+  }
+}
+
+function renderNeeds(urgent) {
+  const box = document.getElementById('needs');
+  box.innerHTML = urgent.length ? '' : '<p>Nothing urgent — nice and quiet. 🎉</p>';
+  urgent.forEach(e => {
+    const d = document.createElement('div');
+    d.className = 'need-item';
+    d.innerHTML = `<div><b>${e.subject}</b><br><small>${e.from_name} • priority ${e.priority}/5 — ${e.triage_reason}</small></div>
+                   <span class="pill" style="background:#ef4444">P${e.priority}</span>`;
+    box.appendChild(d);
+  });
+}
+
+function renderFilters(counts) {
+  const box = document.getElementById('filters');
+  box.innerHTML = '';
+  const mk = (label, cat) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (currentFilter === cat) b.className = 'active';
+    b.onclick = () => { currentFilter = cat; renderFilters(counts); renderEmails(); };
+    box.appendChild(b);
+  };
+  mk('All', '');
+  for (const [cat, n] of Object.entries(counts)) mk(`${CAT_LABELS[cat]} (${n})`, cat);
+}
+
+function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function renderEmails() {
+  const box = document.getElementById('emails');
+  box.innerHTML = '';
+  const list = allEmails.filter(e => !currentFilter || e.category === currentFilter)
+                        .sort((a, b) => b.priority - a.priority);
+  list.forEach((e, i) => {
+    const d = document.createElement('div');
+    d.className = 'email';
+    d.style.animationDelay = (i * 0.05) + 's';
+    d.innerHTML = `
+      <div class="top">
+        <div><div class="subj">${esc(e.subject)}</div>
+        <div class="meta">${esc(e.from_name)} &lt;${esc(e.from)}&gt; • ${new Date(e.date).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div></div>
+        <span class="pill" style="background:${CAT_COLORS[e.category]}">${CAT_LABELS[e.category]} • P${e.priority}</span>
+      </div>
+      <div class="reason">🤖 Triage: ${esc(e.triage_reason)} &nbsp;•&nbsp; Priority: ${esc(e.priority_reason)}</div>
+      <div class="detail">
+        <b>Original email</b><pre>${esc(e.body)}</pre>
+        ${e.task ? `<p style="margin-top:8px">📌 Task found: <b>${esc(e.task.title)}</b> — due ${e.task.due} <small>(${esc(e.task.due_source)})</small></p>` : ''}
+        ${e.draft ? `
+          <div class="draft-box">
+            <b>✍️ Draft reply</b> <small>(${esc(e.draft_reason)})</small>
+            <pre id="draft-${e.id}">${esc(e.draft)}</pre>
+            <button class="btn btn-approve" onclick="approveDraft('${e.id}', this)">✓ Approve</button>
+            <button class="btn btn-edit" onclick="editDraft('${e.id}')">✎ Edit</button>
+            <span id="approved-${e.id}"></span>
+            <br><small style="color:#6b7280">Approving only marks it here — nothing is sent.</small>
+          </div>` : `<p style="margin-top:8px;color:#6b7280">✍️ No draft — ${esc(e.draft_reason)}</p>`}
+      </div>`;
+    d.onclick = (ev) => { if (ev.target.tagName !== 'BUTTON') d.classList.toggle('open'); };
+    box.appendChild(d);
+  });
+}
+
+function renderTasks(tasks) {
+  document.getElementById('taskCount').textContent = `(${tasks.length} tasks)`;
+  const box = document.getElementById('tasks');
+  box.innerHTML = tasks.length ? '' : '<p>No tasks found.</p>';
+  tasks.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'task';
+    d.innerHTML = `<div><b>${esc(t.title)}</b> <small>— from ${t.email_id} • owner: ${t.owner}</small></div><span class="due">due ${t.due}</span>`;
+    box.appendChild(d);
+  });
+}
+
+async function approveDraft(id, btn) {
+  await fetch(`/api/drafts/${id}/approve`, { method: 'POST' });
+  document.getElementById('approved-' + id).innerHTML = '<span class="approved-tag"> ✓ Approved (local only — not sent)</span>';
+  btn.disabled = true;
+}
+
+async function editDraft(id) {
+  const pre = document.getElementById('draft-' + id);
+  const next = prompt('Edit the draft:', pre.textContent);
+  if (next === null) return;
+  await fetch(`/api/drafts/${id}/edit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: next }) });
+  pre.textContent = next;
+}
+
+async function runPipeline() {
+  const btn = document.querySelector('.btn-run');
+  btn.textContent = '⏳ Agents working…'; btn.disabled = true;
+  await fetch('/api/run', { method: 'POST' });
+  await loadAll();
+  btn.textContent = '▶ Run the agents'; btn.disabled = false;
+}
+
+loadAll();
+</script>
+</body>
+</html>
