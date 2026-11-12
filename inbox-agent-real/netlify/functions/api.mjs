@@ -284,6 +284,110 @@ function runPipeline(emails) {
   };
 }
 
+// --- Collections ---------------------------------------------------------
+// COLLECTIONS PRECEDENCE (highest first — first match wins):
+//   government > work-institute > shopping > apps > tech-brands > other
+// Collection is presentation-only: it never feeds triage, priority,
+// drafts or tasks, so triage counts cannot change because of it.
+function domainOf(addr) {
+  const m = /@([^@\s>]+)/.exec(addr || "");
+  return m ? m[1].toLowerCase().replace(/>$/, "") : "";
+}
+function domainHas(domain, ...tokens) {
+  return tokens.some((t) => domain === t || domain.endsWith("." + t) || domain.includes(t));
+}
+
+const SHOPPING_DOMAINS = [
+  "blinkit", "zomato", "amazon", "instamart", "swiggy", "zepto", "meesho",
+  "snapdeal", "bigbasket", "jiomart", "decathlon", "myntra", "ajio", "nykaa",
+  "walmart", "flipkart", "hm.com", "zara", "uniqlo", "shopify", "ebay",
+  "aliexpress", "shein", "nike", "adidas", "puma", "lenskart", "firstcry",
+  "licious", "dunzo", "dominos", "pizza hut", "kfc", "burger king", "mcdonald",
+  "ola foods", "eatfit", "freshmenu", "grofers", "dmart", "reliance retail",
+  "tatacliq", "croma", "vijay sales", "pepperfry", "urban ladder", "ikea",
+  "lifestyle", "shoppers stop", "max fashion", "westside", "bata", "clovia",
+  "purplle", "mamaearth", "pharmeasy", "1mg", "netmeds", "apollo pharmacy",
+];
+const SHOPPING_WORDS = [
+  "blinkit", "zomato", "amazon", "instamart", "swiggy", "zepto", "meesho",
+  "snapdeal", "bigbasket", "jiomart", "decathlon", "myntra", "ajio", "nykaa",
+  "walmart", "flipkart", "order shipped", "order delivered", "order placed",
+  "order has been shipped", "order is out for delivery", "tracking id",
+  "track your order", "your refund", "refund processed", "cashback",
+  "free delivery", "50% off", "% off", "big sale", "sale ends", "festive offer",
+  "food delivery", "order now", "shop now", "add to cart",
+];
+const APP_DOMAINS = [
+  "linkedin", "codeforces", "codechef", "hackerrank", "leetcode", "dukaan",
+  "cashfree", "netlify", "render", "vercel", "github", "gitlab", "bitbucket",
+  "slack", "notion", "figma", "zoom", "dropbox", "spotify", "canva", "atlassian",
+  "jira", "trello", "asana", "monday", "hubspot", "salesforce", "stripe",
+  "razorpay", "paytm", "phonepe", "gpay", "googlepay", "epic", "steam",
+  "discord", "telegram", "whatsapp", "calendly", "airtable", "zapier",
+  "heroku", "digitalocean", "aws", "azure", "firebase", "supabase",
+  "clouddemo", "hostdemo",
+];
+const APP_WORDS = [
+  "subscription", "your plan", "upgrade your plan", "trial ending",
+  "trial expires", "hosting dashboard", "server down", "website is down",
+  "outage", "deployment", "build failed", "build succeeded", "new sign-in",
+  "security alert", "verify your email", "confirm your email",
+  "password reset", "reset your password", "welcome to",
+];
+const TECH_DOMAINS = [
+  "techcrunch", "theverge", "wired", "arstechnica", "hackernews", "ycombinator",
+  "openai", "anthropic", "google", "microsoft", "apple", "samsung", "intel",
+  "nvidia", "meta", "tesla", "producthunt", "stackoverflow", "medium",
+  "substack", "techweekly",
+];
+const TECH_WORDS = [
+  "tech news", "weekly roundup", "newsletter", "tech weekly", "new chip",
+  "ai agents", "sponsor", "sponsored",
+];
+
+function classifyCollection(from, subject, body) {
+  const addr = (from || "").toLowerCase();
+  const domain = domainOf(addr);
+  const text = ((subject || "") + " " + (body || "")).toLowerCase();
+  const hasAny = (words) => words.some((w) => text.includes(w) || addr.includes(w));
+  // 1. Government — govt domains, NSP scholarships, official govt mail.
+  if (
+    domain.endsWith(".gov.in") || domain.endsWith(".nic.in") ||
+    domain.includes("gov.in") || domain.includes("govt") ||
+    domainHas(domain, "uidai", "passportindia", "incometax", "epfindia", "mygov") ||
+    /\bnsp\b/.test(text) || text.includes("national scholarship") ||
+    text.includes("national scholarship portal") ||
+    text.includes("government of india") || text.includes("govt of india") ||
+    text.includes("passport seva") || text.includes("aadhaar")
+  ) {
+    return "government";
+  }
+  // 2. Work & Institute — college/institute domains, internships,
+  // placements, opportunities.
+  if (
+    domain.endsWith(".edu") || domain.endsWith(".edu.in") ||
+    domain.endsWith(".ac.in") || domain.endsWith(".ac.uk") ||
+    domainHas(domain, "iitb.ac.in", "iit", "nit", "university", "college", "institute") ||
+    text.includes("internship") || text.includes("placement") ||
+    text.includes("job opportunity") || text.includes("career opportunity")
+  ) {
+    return "work-institute";
+  }
+  // 3. Shopping — shopping / food-delivery / clothing senders.
+  if (domainHas(domain, ...SHOPPING_DOMAINS) || hasAny(SHOPPING_WORDS)) {
+    return "shopping";
+  }
+  // 4. Apps — notifications from apps / services.
+  if (domainHas(domain, ...APP_DOMAINS) || hasAny(APP_WORDS)) {
+    return "apps";
+  }
+  // 5. Tech & Brands — tech-company mail, brand newsletters, sponsors.
+  if (domainHas(domain, ...TECH_DOMAINS) || hasAny(TECH_WORDS)) {
+    return "tech-brands";
+  }
+  return "other";
+}
+
 // --- Real backend: Gmail OAuth + Blobs persistence -----------------------
 //
 // This section replaces the prototype's in-memory state with a real
@@ -303,10 +407,20 @@ function runPipeline(emails) {
 //                             /api call (except the auth endpoints).
 //   Session token -> user id mapping lives in Blobs; unknown token = 401.
 //
-// SCOPES — gmail.send is ONLY used for (a) a draft the user explicitly
-// approves AND confirms in the UI, and (b) the reminder digest email to
-// the user themself. Nothing is ever sent without the user's explicit
-// approve + confirm, and nothing is ever deleted.
+// SCOPES — a SINGLE scope constant (one-line changeable). gmail.modify
+// supersedes gmail.readonly + gmail.send for this app: it grants read,
+// send, and label modification (needed for mark-as-read/unread), but NOT
+// delete — nothing is ever deleted. A separate verification against
+// Google's docs is confirming that modify covers readonly+send; if it
+// ever says otherwise, change OAUTH_SCOPES below and bump SCOPE_VERSION.
+//   v1 = readonly + send (tokens stored before this change)
+//   v2 = gmail.modify only (current)
+// Stored per user as user.scopeVersion; /api/status reports
+// needsReconnect when the stored version is older — as a prompt only,
+// never by breaking the existing connection (read/send keep working
+// on v1 tokens; only mark-as-read returns 409 until reconnect).
+const SCOPE_VERSION = 2;
+const OAUTH_SCOPES = "https://www.googleapis.com/auth/gmail.modify";
 //
 // STORAGE — Netlify Blobs, store "inbox-agent":
 //   oauth-state:<token>      short-lived CSRF state (10 min)
@@ -315,8 +429,12 @@ function runPipeline(emails) {
 //   users:index              [userId, ...] (for the hourly reminder sweep)
 //   run:<userId>             last pipeline run {results, tasks, counts,
 //                             needs_you_now, meta, lastRunSeconds, ranAt}
+//   cached:<userId>          last successful run summary {counts, total,
+//                             needsYouNow, lastRunAt} (for /api/status)
 //   draftstate:<userId>      {approved:{}, editedDrafts:{}, sent:{}}
-//   settings:<userId>        reminder settings
+//   readstate:<userId>       {emailId: bool} — read/unread overrides
+//   dolater:<userId>         [emailId, ...] — deferred ("do later") ids
+//   settings:<userId>        reminder settings (canonical shape)
 //   reminded:<userId>:<hour> {at} — idempotency marker for /api/remind
 //   mock-sent:<userId>       [recorded mock sends] (mock mode only)
 //
@@ -330,8 +448,6 @@ function runPipeline(emails) {
 
 
 const STORE_NAME = "inbox-agent";
-const GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly";
-const GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send";
 const OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1";
@@ -503,14 +619,136 @@ function gmailHeader(msg, name) {
   return h ? h.value : "";
 }
 
-function findTextPart(part) {
+// --- HTML sanitizing -----------------------------------------------------
+// Why this exists (gibberish-email bug): findTextPart() only ever looked
+// for a text/plain part, so for HTML-only mail (no text/plain part —
+// common from LinkedIn, Codeforces, marketing senders) the body fell
+// back to the truncated snippet, and for mail whose only text part IS
+// raw HTML source (mislabeled / HTML dumped into a plain part) the raw
+// source landed in `body` — which the frontend escapes and shows as
+// visible tag gibberish. Fix: prefer the text/html part, sanitize it,
+// and never let raw HTML source through as the body.
+
+function decodeHtmlEntities(s) {
+  if (!s) return "";
+  let out = String(s);
+  for (let i = 0; i < 3; i++) {
+    const prev = out;
+    out = out
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&apos;/gi, "'")
+      .replace(/&#0*39;/g, "'")
+      .replace(/&#x27;/gi, "'")
+      .replace(/&#(\d+);/g, (_, n) => {
+        const c = parseInt(n, 10);
+        return c >= 0 && c <= 0x10ffff ? String.fromCodePoint(c) : "";
+      })
+      .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
+        const c = parseInt(n, 16);
+        return c >= 0 && c <= 0x10ffff ? String.fromCodePoint(c) : "";
+      });
+    if (out === prev) break;
+  }
+  return out;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Tags the detail pane may render, and the only attributes kept on each.
+const SAFE_TAGS = {
+  a: ["href", "title"],
+  b: [], strong: [], i: [], em: [], u: [], s: [], small: [],
+  p: [], br: [], div: [], span: [], blockquote: [], pre: [], code: [],
+  ul: [], ol: [], li: [], h1: [], h2: [], h3: [], h4: [], h5: [], h6: [],
+  table: [], thead: [], tbody: [], tr: [], td: [], th: [], hr: [], img: ["src", "alt", "title"],
+};
+const DANGEROUS_SCHEMES = /^(javascript|vbscript|data|file):/i;
+
+function sanitizeHtml(html) {
+  if (!html) return "";
+  // Decode entities first so encoded attacks (&lt;script&gt;) become real
+  // tags here and get stripped, instead of surviving as text.
+  let s = decodeHtmlEntities(String(html));
+  // Strip comments, and whole dangerous elements including their content.
+  // NOTE: html/head/body/title are NOT in this list — they are structural
+  // wrappers, so only their tags are dropped (by the rebuild below) and
+  // their inner text is kept. Putting them here once stripped the entire
+  // document.
+  s = s.replace(/<!--[\s\S]*?-->/g, "");
+  s = s.replace(
+    /<(script|style|iframe|object|embed|form|noscript|template|svg|math|video|audio|input|button|select|textarea)\b[^>]*>[\s\S]*?(<\/\1\s*>|$)/gi,
+    "",
+  );
+  s = s.replace(/<(script|style|iframe|object|embed|link|meta|base)\b[^>]*\/?>/gi, "");
+  // Rebuild tag by tag: drop disallowed tags (keep their inner text),
+  // keep allowed tags with only safe attributes; drop event handlers,
+  // style attributes, and javascript:/data: URLs entirely.
+  s = s.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g, (whole, rawTag, rawAttrs) => {
+    const tag = rawTag.toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(SAFE_TAGS, tag)) return "";
+    if (whole.startsWith("</")) return `</${tag}>`;
+    if (tag === "br" || tag === "hr") return `<${tag}>`;
+    const allowed = SAFE_TAGS[tag];
+    let attrs = "";
+    const attrRe = /([a-zA-Z-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/g;
+    let m;
+    while ((m = attrRe.exec(rawAttrs || "")) !== null) {
+      const name = m[1].toLowerCase();
+      if (!allowed.includes(name)) continue; // drops on*, style, etc.
+      let value = m[2].replace(/^["']|["']$/g, "").trim();
+      if ((name === "href" || name === "src") && (DANGEROUS_SCHEMES.test(value) || /^\s*\/\//.test(value))) continue;
+      if (name === "href" && !/^(https?:|mailto:)/i.test(value)) continue;
+      if (name === "src" && !/^https?:/i.test(value)) continue;
+      attrs += ` ${name}="${escapeHtml(value).replace(/"/g, "&quot;")}"`;
+    }
+    return `<${tag}${attrs}>`;
+  });
+  return s.trim();
+}
+
+// Plain-text view of an HTML body: block boundaries become line breaks.
+function htmlToText(html) {
+  if (!html) return "";
+  let s = String(html);
+  // Never leak script/style content into the plain text.
+  s = s.replace(/<(script|style|noscript|template)\b[^>]*>[\s\S]*?(<\/\1\s*>|$)/gi, "");
+  s = s.replace(/<(br|hr)\b[^>]*>/gi, "\n");
+  s = s.replace(/<\/(p|div|li|tr|h[1-6]|blockquote|table)\s*>/gi, "\n");
+  s = s.replace(/<li\b[^>]*>/gi, "\n• ");
+  s = s.replace(/<[^>]*>/g, "");
+  s = decodeHtmlEntities(s);
+  return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// True when a supposed "plain text" body is actually HTML source.
+function looksLikeHtml(text) {
+  return /<\s*(html|body|div|table|tr|td|span|p|a|head|!doctype)[\s>]/i.test(text || "");
+}
+
+function findPart(part, mimeType) {
   if (!part) return null;
-  if (part.mimeType === "text/plain" && part.body?.data) return part.body.data;
+  if (part.mimeType === mimeType && part.body?.data) return part.body.data;
   for (const p of part.parts || []) {
-    const found = findTextPart(p);
+    const found = findPart(p, mimeType);
     if (found) return found;
   }
   return null;
+}
+
+// Back-compat name: findTextPart now means "find a text/plain part".
+function findTextPart(part) {
+  return findPart(part, "text/plain");
 }
 
 function pad2(n) {
@@ -546,16 +784,37 @@ function extractName(fromRaw) {
 
 // Convert one Gmail API message (format=full) into the engine's email
 // shape plus thread/message metadata (kept out of the engine shape and
-// stored alongside the run, for replies).
+// stored alongside the run, for replies). The engine runs on `body`
+// (plain text). `bodyHtml`/`bodyText` are presentation fields: prefer
+// the text/html part (sanitized), fall back to text/plain with line
+// breaks preserved; a plain part that is actually HTML source is
+// treated as HTML. Raw HTML source is NEVER returned as `body`.
 function parseGmailMessage(msg) {
   const fromRaw = gmailHeader(msg, "From") || "";
-  const data = findTextPart(msg.payload);
-  const body = data ? b64urlDecode(data) : msg.snippet || "";
+  const htmlData = findPart(msg.payload, "text/html");
+  const textData = findTextPart(msg.payload);
+  let htmlRaw = htmlData ? b64urlDecode(htmlData) : null;
+  let textRaw = textData ? b64urlDecode(textData) : null;
+  // Mislabeled mail: the "plain" part is HTML source — treat it as HTML.
+  if (!htmlRaw && textRaw && looksLikeHtml(textRaw)) {
+    htmlRaw = textRaw;
+    textRaw = null;
+  }
+  const bodyText = textRaw || (htmlRaw ? htmlToText(htmlRaw) : "") || msg.snippet || "";
+  const bodyHtml = htmlRaw
+    ? sanitizeHtml(htmlRaw)
+    : escapeHtml(bodyText).replace(/\r?\n/g, "<br>");
+  // `body` stays plain text so the engine (triage/draft/task) is unchanged.
+  const body = bodyText;
+  const labelIds = msg.labelIds || [];
+  const read = !labelIds.includes("UNREAD");
   return {
     email: {
       id: msg.id,
       subject: gmailHeader(msg, "Subject") || "(no subject)",
       body,
+      bodyText,
+      bodyHtml: bodyHtml || null,
       from: extractAddr(fromRaw),
       from_name: extractName(fromRaw),
       date: toEngineDate(gmailHeader(msg, "Date")),
@@ -564,7 +823,10 @@ function parseGmailMessage(msg) {
       threadId: msg.threadId || null,
       messageId: gmailHeader(msg, "Message-ID") || null,
       references: gmailHeader(msg, "References") || null,
+      read,
+      labelIds,
     },
+    read,
   };
 }
 
@@ -577,6 +839,9 @@ function mockGmailMessage(e) {
     id: e.id,
     threadId: "thread-" + e.id,
     snippet: e.body.slice(0, 100),
+    // Seed mail has no read flag, so it is UNREAD (read: false) — the
+    // contract default. A seed with `read: true` would list INBOX only.
+    labelIds: e.read ? ["INBOX"] : ["INBOX", "UNREAD"],
     payload: {
       mimeType: "text/plain",
       headers: [
@@ -693,6 +958,14 @@ async function runPipelineForUser(user) {
     ranAt: new Date().toISOString(),
   };
   await storeSetJSON(`run:${user.id}`, record);
+  // Cached summary for /api/status: the frontend shows the last organized
+  // state instantly without re-running the pipeline.
+  await storeSetJSON(`cached:${user.id}`, {
+    counts: result.counts,
+    total: result.total,
+    needsYouNow: result.needs_you_now,
+    lastRunAt: record.ranAt,
+  });
   return record;
 }
 
@@ -729,9 +1002,58 @@ function withDraftState(result, draftState) {
   });
 }
 
+// Scope version of a stored token: v1 tokens predate the gmail.modify
+// switch and have no scopeVersion field. Never defaults a real stored
+// user to v2 — only the mock user carries v2 explicitly.
+function userScopeVersion(user) {
+  return user?.scopeVersion ?? 1;
+}
+
+// --- Read / do-later state (per user, Blobs) ------------------------------
+
+async function getReadState(userId) {
+  return (await storeGetJSON(`readstate:${userId}`)) || {};
+}
+async function setReadState(userId, s) {
+  await storeSetJSON(`readstate:${userId}`, s);
+}
+async function getDoLaterSet(userId) {
+  const ids = (await storeGetJSON(`dolater:${userId}`)) || [];
+  return new Set(Array.isArray(ids) ? ids : []);
+}
+async function setDoLaterSet(userId, set) {
+  await storeSetJSON(`dolater:${userId}`, [...set]);
+}
+
+// Attach the contract fields to pipeline results. Collection is computed
+// from sender/subject/body at read time (so stored runs from before
+// collections still get one); read prefers an explicit read-state
+// override, then the Gmail UNREAD label captured at fetch time; doLater
+// comes from the per-user Blobs set. bodyHtml/bodyText fall back to the
+// plain body for runs stored before they existed.
+async function enrichEmails(result, userId) {
+  const draftState = await getDraftState(userId);
+  const readState = await getReadState(userId);
+  const doLater = await getDoLaterSet(userId);
+  return withDraftState(result, draftState).map((r) => {
+    const metaRead = result.meta?.[r.id]?.read;
+    const read = r.id in readState ? !!readState[r.id] : metaRead === undefined ? false : !!metaRead;
+    const bodyText = r.bodyText ?? r.body ?? "";
+    const bodyHtml = r.bodyHtml ?? (bodyText ? escapeHtml(bodyText).replace(/\r?\n/g, "<br>") : null);
+    return {
+      ...r,
+      collection: classifyCollection(r.from, r.subject, r.body),
+      read,
+      doLater: doLater.has(r.id),
+      bodyHtml,
+      bodyText,
+    };
+  });
+}
+
 // --- Auth -------------------------------------------------------------------
 
-const MOCK_USER = { id: "mock-user", email: "mock@example.test", refreshToken: "mock-refresh" };
+const MOCK_USER = { id: "mock-user", email: "mock@example.test", refreshToken: "mock-refresh", scopeVersion: SCOPE_VERSION };
 
 // Returns {user, userId} or null. In mock mode (local verification only)
 // any request acts as the mock user — production mode requires a valid
@@ -812,39 +1134,116 @@ function nowPartsInTz(tz) {
 }
 
 const DEFAULT_SETTINGS = {
+  enabled: false,
   frequency: 1,
   hours: ["09:00"],
   timezone: "Asia/Kolkata",
-  enabled: false,
 };
 
-function validateSettings(body) {
-  if (!body || typeof body !== "object") return "Settings must be a JSON object.";
-  const { frequency, hours, timezone, enabled } = body;
-  if (!Number.isInteger(frequency) || frequency < 1 || frequency > 5) {
-    return "frequency must be an integer from 1 to 5.";
+// The reminder digest — one builder shared by the hourly sweep and
+// POST /api/reminders/test, so the test sends exactly what the sweep sends.
+function buildReminderDigest(result, todayDate, baseUrl) {
+  const dueToday = result.tasks.filter((t) => t.due <= todayDate);
+  return {
+    subject: "Inbox Agent: check your sorted mail",
+    body: [
+      "Hi,",
+      "",
+      "Your inbox, sorted:",
+      `- ${result.counts.urgent} urgent`,
+      `- ${result.counts.action} need action`,
+      `- ${dueToday.length} task(s) due today or overdue`,
+      `- ${result.tasks.length} tasks total`,
+      "",
+      `Open Inbox Agent: ${baseUrl}/`,
+      "",
+      "— Inbox Agent (you asked for this reminder; turn it off in Settings)",
+    ].join("\n"),
+  };
+}
+
+// Canonical settings shape (the contract — GET always returns this):
+//   { enabled: bool, frequency: int 1-5,
+//     hours: ["HH:MM", ...] (length == frequency, distinct),
+//     timezone: string }
+// ROOT CAUSE of the settings bug (verified in code): the frontend's
+// saveSettings sends `frequency_per_day`, but this handler only read
+// `body.frequency` — so `frequency` was undefined and validateSettings
+// rejected every save with "frequency must be an integer from 1 to 5."
+// Fix: accept `frequency_per_day` as an alias, normalize to the
+// canonical shape, and validate with messages that say what was wrong
+// and what to send instead.
+function normalizeSettings(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "Settings must be a JSON object." };
   }
-  if (!Array.isArray(hours) || hours.length !== frequency) {
-    return "hours must be an array with exactly `frequency` entries.";
+  const rawFreq = body.frequency !== undefined ? body.frequency : body.frequency_per_day;
+  if (rawFreq === undefined) {
+    return { error: "frequency is required — send an integer from 1 to 5 (frequency, or frequency_per_day)." };
   }
+  if (typeof rawFreq === "string" || !Number.isInteger(rawFreq) || rawFreq < 1 || rawFreq > 5) {
+    return { error: `frequency must be an integer from 1 to 5 (got ${JSON.stringify(rawFreq)} — send a number, e.g. 2, not "2 per day").` };
+  }
+  const frequency = rawFreq;
+  const hours = body.hours;
+  if (!Array.isArray(hours)) {
+    return { error: `hours must be an array with exactly ${frequency} "HH:MM" entr${frequency === 1 ? "y" : "ies"} (one per daily reminder).` };
+  }
+  if (hours.length !== frequency) {
+    return { error: `hours must have exactly ${frequency} entr${frequency === 1 ? "y" : "ies"} to match frequency ${frequency} (got ${hours.length}).` };
+  }
+  const seen = new Set();
   for (const h of hours) {
-    if (typeof h !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(h)) {
-      return `each hour must be a valid "HH:MM" string (got ${JSON.stringify(h)}).`;
+    if (typeof h !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(h.trim())) {
+      return { error: `each hour must be a valid "HH:MM" string (got ${JSON.stringify(h)}).` };
     }
+    const hh = h.trim();
+    if (seen.has(hh)) {
+      return { error: `hours must be distinct — ${hh} appears more than once.` };
+    }
+    seen.add(hh);
   }
-  if (typeof timezone !== "string" || !timezone) return "timezone must be a non-empty string.";
+  const timezone = body.timezone;
+  if (typeof timezone !== "string" || !timezone.trim()) {
+    return { error: 'timezone is required and must be a non-empty string (e.g. "Asia/Kolkata").' };
+  }
+  // "Asia/Mumbai" is not an IANA zone name (this Node/ICU build rejects
+  // it), but it is what users type for Mumbai — it is the same zone as
+  // Asia/Kolkata, so alias it instead of rejecting the save. The stored
+  // value is the canonical name, so the reminder sweep can use it.
+  const TIMEZONE_ALIASES = { "asia/mumbai": "Asia/Kolkata", "asia/bombay": "Asia/Kolkata", "asia/calcutta": "Asia/Kolkata" };
+  const tz = TIMEZONE_ALIASES[timezone.trim().toLowerCase()] || timezone.trim();
   try {
-    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
   } catch {
-    return `unknown timezone: ${timezone}`;
+    return { error: `unknown timezone: ${JSON.stringify(timezone)}.` };
   }
-  if (typeof enabled !== "boolean") return "enabled must be a boolean.";
-  return null;
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return { error: `enabled must be a boolean (got ${JSON.stringify(body.enabled)}).` };
+  }
+  // Saving settings opts in unless the caller explicitly disables them.
+  return {
+    settings: {
+      enabled: body.enabled !== undefined ? body.enabled : true,
+      frequency,
+      hours: hours.map((h) => h.trim()),
+      timezone: tz,
+    },
+  };
+}
+
+// Canonicalize a stored (possibly legacy) settings object for GET.
+function canonicalSettings(saved) {
+  if (!saved) return { ...DEFAULT_SETTINGS };
+  const { settings, error } = normalizeSettings(saved);
+  return error ? { ...DEFAULT_SETTINGS } : settings;
 }
 
 // --- Routes ---------------------------------------------------------------------
 
 const EMAIL_RE = /^\/api\/emails\/([^/]+)$/;
+const EMAIL_READ_RE = /^\/api\/emails\/([^/]+)\/read$/;
+const EMAIL_DOLATER_RE = /^\/api\/emails\/([^/]+)\/do-later$/;
 const APPROVE_RE = /^\/api\/drafts\/([^/]+)\/approve$/;
 const EDIT_RE = /^\/api\/drafts\/([^/]+)\/edit$/;
 const SEND_RE = /^\/api\/drafts\/([^/]+)\/send$/;
@@ -854,13 +1253,17 @@ function isKnownPath(path) {
     path === "/api/status" ||
     path === "/api/run" ||
     path === "/api/emails" ||
+    path === "/api/do-later" ||
     path === "/api/tasks" ||
     path === "/api/auth/start" ||
     path === "/api/auth/callback" ||
     path === "/api/auth/disconnect" ||
     path === "/api/reminders/settings" ||
+    path === "/api/reminders/test" ||
     path === "/api/remind" ||
     EMAIL_RE.test(path) ||
+    EMAIL_READ_RE.test(path) ||
+    EMAIL_DOLATER_RE.test(path) ||
     APPROVE_RE.test(path) ||
     EDIT_RE.test(path) ||
     SEND_RE.test(path)
@@ -888,7 +1291,7 @@ export default async (req) => {
       client_id: process.env.GOOGLE_CLIENT_ID,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: `${GMAIL_READONLY} ${GMAIL_SEND}`,
+      scope: OAUTH_SCOPES,
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "true",
@@ -903,7 +1306,14 @@ export default async (req) => {
     const state = url.searchParams.get("state");
     const err = url.searchParams.get("error");
     if (err) {
-      return htmlResponse("Google sign-in failed", `Google returned an error: ${err}. Please try connecting again.`, 400);
+      // Google refused (e.g. access_denied — the account is not a test
+      // user): send the user back to the app with the error visible,
+      // instead of a blank failure page.
+      const errText = url.searchParams.get("error_description") || err;
+      return new Response(null, {
+        status: 302,
+        headers: { Location: siteUrl(req) + "/?error=" + encodeURIComponent(errText) },
+      });
     }
     if (!code || !state) {
       return htmlResponse("Google sign-in failed", "Missing code or state in the callback. Please try connecting again.", 400);
@@ -950,7 +1360,7 @@ export default async (req) => {
     if (!googleId || !email) {
       return htmlResponse("Google sign-in failed", "Signed in, but the account email could not be read. Please try connecting again.", 400);
     }
-    const user = { id: googleId, email, refreshToken: tokens.refresh_token, createdAt: Date.now() };
+    const user = { id: googleId, email, refreshToken: tokens.refresh_token, createdAt: Date.now(), scopeVersion: SCOPE_VERSION };
     await storeSetJSON(`user:${user.id}`, user);
     await addUserToIndex(user.id);
     const sessionToken = randomToken();
@@ -971,11 +1381,56 @@ export default async (req) => {
     });
   }
 
-  // --- OAuth: disconnect (delete the session server-side) ---
+  // --- OAuth: disconnect ---
+  // Old bug: only the bearer session token was deleted — the stored
+  // refresh token (user:<id>) and the users:index entry survived, so
+  // the old account stayed connected server-side (reminder sweep kept
+  // mailing it) and a different Gmail could not cleanly take over.
+  // Fix: clear the session(s), the stored token, and all per-user state.
   if (method === "POST" && path === "/api/auth/disconnect") {
     const h = req.headers.get("authorization") || "";
     const token = h.startsWith("Bearer ") ? h.slice(7).trim() : null;
-    if (token) await store.delete(`session:${token}`);
+    let userId = null;
+    if (token) {
+      const session = await storeGetJSON(`session:${token}`);
+      if (session?.userId) userId = session.userId;
+      await store.delete(`session:${token}`);
+    }
+    if (userId) {
+      // Any other sessions for the same user (e.g. a second browser).
+      try {
+        const listed = await store.list({ prefix: "session:" });
+        for (const b of listed.blobs || []) {
+          const s = await storeGetJSON(b.key);
+          if (s?.userId === userId) await store.delete(b.key);
+        }
+      } catch {
+        /* session sweep is best-effort; the bearer token above is gone */
+      }
+      await store.delete(`user:${userId}`);
+      const idx = (await storeGetJSON("users:index")) || [];
+      if (idx.includes(userId)) {
+        await storeSetJSON("users:index", idx.filter((id) => id !== userId));
+      }
+      // Per-user state tied to that Gmail account.
+      for (const key of [
+        `run:${userId}`,
+        `cached:${userId}`,
+        `draftstate:${userId}`,
+        `readstate:${userId}`,
+        `dolater:${userId}`,
+        `settings:${userId}`,
+        `mock-sent:${userId}`,
+      ]) {
+        await store.delete(key);
+      }
+      try {
+        const reminded = await store.list({ prefix: `reminded:${userId}:` });
+        for (const b of reminded.blobs || []) await store.delete(b.key);
+      } catch {
+        /* best-effort */
+      }
+    }
     return jsonResponse({ disconnected: true });
   }
 
@@ -983,6 +1438,13 @@ export default async (req) => {
   if (method === "GET" && path === "/api/status") {
     const auth = await getAuth(req);
     const run = auth ? await getStoredRun(auth.userId) : null;
+    const cachedStored = auth ? await storeGetJSON(`cached:${auth.userId}`) : null;
+    // Fall back to the stored run for accounts whose last run predates caching.
+    const cachedRun = cachedStored ||
+      (run
+        ? { counts: run.counts, total: run.total, needsYouNow: run.needs_you_now, lastRunAt: run.ranAt }
+        : null);
+    const storedScope = auth ? userScopeVersion(auth.user) : SCOPE_VERSION;
     return jsonResponse({
       engine: "deterministic rules only (no LLM)",
       llm_available: false,
@@ -991,6 +1453,11 @@ export default async (req) => {
       note: "Real Gmail via OAuth. Drafts are only sent after you approve AND confirm them; nothing is deleted.",
       connected: !!auth,
       email: auth ? auth.user.email : null,
+      scopeVersion: SCOPE_VERSION,
+      // Prompt only: a v1 token keeps working for read/send; only
+      // mark-as-read needs the reconnect (it returns 409 until then).
+      needsReconnect: auth ? storedScope < SCOPE_VERSION : false,
+      cachedRun,
     });
   }
 
@@ -1025,10 +1492,11 @@ export default async (req) => {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
-    const draftState = await getDraftState(auth.userId);
-    let emails = withDraftState(result, draftState);
+    let emails = await enrichEmails(result, auth.userId);
     const category = url.searchParams.get("category") || "";
     if (category) emails = emails.filter((r) => r.category === category);
+    const collection = url.searchParams.get("collection") || "";
+    if (collection) emails = emails.filter((r) => r.collection === collection);
     return jsonResponse({ emails, counts: result.counts });
   }
 
@@ -1044,10 +1512,96 @@ export default async (req) => {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
     const id = decodeURIComponent(emailMatch[1]);
-    const draftState = await getDraftState(auth.userId);
-    const found = withDraftState(result, draftState).find((r) => r.id === id);
+    const found = (await enrichEmails(result, auth.userId)).find((r) => r.id === id);
     if (!found) return jsonResponse({ detail: "email not found" }, 404);
     return jsonResponse(found);
+  }
+
+  // --- Mark as read / unread (needs gmail.modify, i.e. scope v2) ---
+  const readMatch = EMAIL_READ_RE.exec(path);
+  if (method === "POST" && readMatch) {
+    const { auth, error } = await requireAuth(req);
+    if (error) return error;
+    const id = decodeURIComponent(readMatch[1]);
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return jsonResponse({ detail: "Invalid JSON — expected {read: boolean}." }, 422);
+    }
+    if (typeof body.read !== "boolean") {
+      return jsonResponse({ detail: "Expected JSON {read: boolean}." }, 422);
+    }
+    if (userScopeVersion(auth.user) < SCOPE_VERSION) {
+      // Applies in mock mode too: the mock user is v2 (mock modify
+      // succeeds), a stored v1 token gets the 409 here instead of a
+      // misleading Gmail error.
+      return jsonResponse(
+        { detail: "Marking read/unread needs the updated Gmail permission (gmail.modify). Reconnect Gmail to grant it — reading and sending still work meanwhile.", needsReconnect: true },
+        409,
+      );
+    }
+    if (!isMock()) {
+      try {
+        const accessToken = await refreshAccessToken(auth.user.refreshToken);
+        await gmailApi(accessToken, `/users/me/messages/${encodeURIComponent(id)}/modify`, {
+          method: "POST",
+          body: JSON.stringify(
+            body.read ? { removeLabelIds: ["UNREAD"] } : { addLabelIds: ["UNREAD"] },
+          ),
+        });
+      } catch (e) {
+        // Google refusing for permissions means the stored token predates
+        // the modify scope even though it claims otherwise.
+        if (/insufficient|forbidden|permission/i.test(e.message || "")) {
+          return jsonResponse(
+            { detail: "Gmail refused the label change — the stored token lacks the modify permission. Reconnect Gmail to grant it.", needsReconnect: true },
+            409,
+          );
+        }
+        return jsonResponse({ detail: `Mark as read failed: ${e.message}` }, 502);
+      }
+    }
+    const readState = await getReadState(auth.userId);
+    readState[id] = body.read;
+    await setReadState(auth.userId, readState);
+    return jsonResponse({ id, read: body.read });
+  }
+
+  // --- Do later: defer / un-defer an email (per-user Blobs set) ---
+  const doLaterMatch = EMAIL_DOLATER_RE.exec(path);
+  if (method === "POST" && doLaterMatch) {
+    const { auth, error } = await requireAuth(req);
+    if (error) return error;
+    const id = decodeURIComponent(doLaterMatch[1]);
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return jsonResponse({ detail: "Invalid JSON — expected {doLater: boolean}." }, 422);
+    }
+    if (typeof body.doLater !== "boolean") {
+      return jsonResponse({ detail: "Expected JSON {doLater: boolean}." }, 422);
+    }
+    const set = await getDoLaterSet(auth.userId);
+    if (body.doLater) set.add(id);
+    else set.delete(id);
+    await setDoLaterSet(auth.userId, set);
+    return jsonResponse({ id, doLater: body.doLater });
+  }
+
+  // --- Do-later list ---
+  if (method === "GET" && path === "/api/do-later") {
+    const { auth, error } = await requireAuth(req);
+    if (error) return error;
+    let result;
+    try {
+      result = await ensureRun(auth.user);
+    } catch (e) {
+      return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
+    }
+    const emails = (await enrichEmails(result, auth.userId)).filter((r) => r.doLater);
+    return jsonResponse({ emails, count: emails.length });
   }
 
   // --- Tasks ---
@@ -1154,7 +1708,7 @@ export default async (req) => {
     if (error) return error;
     if (method === "GET") {
       const saved = await storeGetJSON(`settings:${auth.userId}`);
-      return jsonResponse(saved || DEFAULT_SETTINGS);
+      return jsonResponse(canonicalSettings(saved));
     }
     if (method === "POST") {
       let body;
@@ -1163,18 +1717,41 @@ export default async (req) => {
       } catch {
         return jsonResponse({ detail: "Invalid JSON" }, 422);
       }
-      const problem = validateSettings(body);
+      const { settings, error: problem } = normalizeSettings(body);
       if (problem) return jsonResponse({ detail: problem }, 422);
-      const settings = {
-        frequency: body.frequency,
-        hours: body.hours,
-        timezone: body.timezone,
-        enabled: body.enabled,
-      };
       await storeSetJSON(`settings:${auth.userId}`, settings);
       await addUserToIndex(auth.userId);
       return jsonResponse(settings);
     }
+  }
+
+  // --- Test reminder: the same digest the sweep sends, right now ---
+  if (method === "POST" && path === "/api/reminders/test") {
+    const { auth, error } = await requireAuth(req);
+    if (error) return error;
+    let result;
+    try {
+      result = await runPipelineForUser(auth.user);
+    } catch (e) {
+      return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
+    }
+    const tz = (await storeGetJSON(`settings:${auth.userId}`))?.timezone || "Asia/Kolkata";
+    const { date } = nowPartsInTz(tz);
+    const digest = buildReminderDigest(result, date, siteUrl(req));
+    try {
+      const accessToken = await refreshAccessToken(auth.user.refreshToken);
+      await sendGmailRaw(auth.user, accessToken, {
+        to: auth.user.email,
+        subject: digest.subject,
+        body: digest.body,
+        threadId: null,
+        inReplyTo: null,
+        references: null,
+      });
+    } catch (e) {
+      return jsonResponse({ detail: `Test reminder failed: ${e.message}` }, 502);
+    }
+    return jsonResponse({ sent: true, email: auth.user.email });
   }
 
   // --- Hourly reminder sweep (called by GitHub Actions cron) ---
@@ -1202,25 +1779,12 @@ export default async (req) => {
         // Idempotent per hour: skip users already reminded this hour.
         if (await storeGetJSON(`reminded:${userId}:${hourKey}`)) continue;
         const result = await runPipelineForUser(user);
-        const dueToday = result.tasks.filter((t) => t.due <= now.date);
-        const bodyLines = [
-          "Hi,",
-          "",
-          "Your inbox, sorted:",
-          `- ${result.counts.urgent} urgent`,
-          `- ${result.counts.action} need action`,
-          `- ${dueToday.length} task(s) due today or overdue`,
-          `- ${result.tasks.length} tasks total`,
-          "",
-          `Open Inbox Agent: ${siteUrl(req)}/`,
-          "",
-          "— Inbox Agent (you asked for this reminder; turn it off in Settings)",
-        ];
+        const digest = buildReminderDigest(result, now.date, siteUrl(req));
         const accessToken = await refreshAccessToken(user.refreshToken);
         await sendGmailRaw(user, accessToken, {
           to: user.email,
-          subject: "Inbox Agent: check your sorted mail",
-          body: bodyLines.join("\n"),
+          subject: digest.subject,
+          body: digest.body,
           threadId: null,
           inReplyTo: null,
           references: null,
@@ -1241,3 +1805,22 @@ export default async (req) => {
 };
 
 export const config = { path: "/api/*" };
+
+// Named exports for local verification only (the handler above stays the
+// default export). Lets tests drive parseGmailMessage / classifyCollection
+// / sanitizeHtml / normalizeSettings without a live Gmail account, and
+// lets the disconnect test seed + inspect Blobs state.
+export {
+  classifyCollection,
+  sanitizeHtml,
+  htmlToText,
+  decodeHtmlEntities,
+  parseGmailMessage,
+  normalizeSettings,
+  canonicalSettings,
+  buildReminderDigest,
+  runPipeline,
+  SCOPE_VERSION,
+  OAUTH_SCOPES,
+  store as __testStore,
+};
