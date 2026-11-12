@@ -10,8 +10,3 @@
     "netlify/functions/api/data/**",
     "netlify/functions/api/static/**",
   ]
-
-[[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/api/:splat"
-  status = 200
