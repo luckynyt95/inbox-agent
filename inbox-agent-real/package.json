@@ -1,0 +1,1 @@
+{"dependencies":{"@netlify/blobs":"^10.7.13"},"description":"Inbox Agent v1 — Netlify Functions v2 backend connecting to any Gmail via OAuth. Zero dependencies except @netlify/blobs (provided by the Netlify functions runtime). No build step.","name":"inbox-agent-real","private":true,"type":"module","version":"1.0.0"}
