@@ -8,20 +8,42 @@
 
 var TOKEN_KEY = 'inbox_agent_token';
 var EMAIL_KEY = 'inbox_agent_email';
+var THEME_KEY = 'ia-theme';
 
 var CATEGORIES = ['urgent', 'action', 'fyi', 'promo', 'spam'];
 var CAT_LABELS = { urgent: 'Urgent', action: 'Action', fyi: 'FYI', promo: 'Promo', spam: 'Spam' };
+
+/* Collections, in precedence order (government > work-institute >
+   shopping > apps > tech-brands > other). The backend assigns each
+   email one collection; the frontend only displays and filters by it. */
+var COLLECTIONS = ['shopping', 'tech-brands', 'work-institute', 'government', 'apps', 'other'];
+var COL_LABELS = {
+  shopping: 'Shopping', 'tech-brands': 'Tech & Brands', 'work-institute': 'Work & Institute',
+  government: 'Government', apps: 'Apps', other: 'Other'
+};
+
+/* Default reminder hours when frequency rises: a spread, never a
+   duplicated 09:00. Index i of SPREAD_HOURS is the default hour for
+   reminder slot i+1. */
+var SPREAD_HOURS = ['09:00', '13:00', '18:00', '20:00', '21:00'];
+
+var RECONNECT_MSG = 'Reconnect to enable mark-as-read — Disconnect, then Connect Gmail again.';
 
 var token = localStorage.getItem(TOKEN_KEY) || '';
 var accountEmail = localStorage.getItem(EMAIL_KEY) || '';
 
 var allEmails = [];
+var doLaterEmails = [];
 var counts = { urgent: 0, action: 0, fyi: 0, promo: 0, spam: 0 };
 var tasks = [];
 var currentFilter = '';
+var currentCollection = 'all';
 var selectedId = null;
 var selectedEmail = null;
 var settingsLoaded = false;
+var needsReconnect = false;
+var cachedRun = null;
+var urlErrorMsg = '';
 
 /* ---------- helpers ---------- */
 
@@ -57,6 +79,27 @@ function showError(msg) {
 
 function hideError() { $('errorBar').hidden = true; }
 
+/* ---------- theme ---------- */
+
+function applyTheme(theme) {
+  if (theme !== 'dark' && theme !== 'light') theme = 'light';
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem(THEME_KEY, theme);
+  var btn = $('themeToggle');
+  if (btn) btn.textContent = theme === 'dark' ? 'Light mode' : 'Dark mode';
+}
+
+function initTheme() {
+  var saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (e) { /* storage unavailable */ }
+  applyTheme(saved === 'dark' ? 'dark' : 'light');
+}
+
+function toggleTheme() {
+  var cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+}
+
 /* ---------- auth ---------- */
 
 function readTokenFromUrl() {
@@ -78,6 +121,20 @@ function readTokenFromUrl() {
   url.searchParams.delete('email');
   window.history.replaceState(null, '', url.pathname + url.search + url.hash);
   return true;
+}
+
+/* OAuth errors arrive as /?error=<urlencoded text>. Surface that exact
+   text in the error bar — never a blank banner — then clean it out of
+   the address bar. */
+function readErrorFromUrl() {
+  var params = new URLSearchParams(window.location.search);
+  var err = params.get('error');
+  if (!err) return;
+  urlErrorMsg = err;
+  showError(err);
+  var url = new URL(window.location.href);
+  url.searchParams.delete('error');
+  window.history.replaceState(null, '', url.pathname + url.search + url.hash);
 }
 
 function renderAuth() {
@@ -121,10 +178,31 @@ async function disconnect() {
   accountEmail = '';
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(EMAIL_KEY);
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(EMAIL_KEY);
+  } catch (e) { /* sessionStorage unavailable */ }
   allEmails = [];
+  doLaterEmails = [];
   tasks = [];
+  counts = { urgent: 0, action: 0, fyi: 0, promo: 0, spam: 0 };
+  currentFilter = '';
+  currentCollection = 'all';
   selectedId = null;
   selectedEmail = null;
+  settingsLoaded = false;
+  needsReconnect = false;
+  cachedRun = null;
+  urlErrorMsg = '';
+  $('reconnectBanner').hidden = true;
+  $('emailList').innerHTML = '<p class="muted pad">Loading…</p>';
+  $('detailContent').innerHTML = '<p class="muted pad">Select an email to read it.</p>';
+  $('detailPane').classList.remove('open');
+  $('detailBackBtn').hidden = true;
+  renderCounts();
+  renderFilters();
+  renderCollectionTabs();
+  renderDoLater();
   hideError();
   renderAuth();
   showConnectState();
@@ -172,15 +250,19 @@ async function api(path, options) {
 /* ---------- loading ---------- */
 
 async function loadAll() {
-  hideError();
+  // An OAuth ?error= message from the URL survives the load: it is the
+  // reason the user is here, so loading must not clear it.
+  if (!urlErrorMsg) hideError();
   var results = await Promise.allSettled([
     api('/api/status'),
     api('/api/emails'),
-    api('/api/tasks')
+    api('/api/tasks'),
+    api('/api/do-later')
   ]);
   var statusFailed = results[0].status === 'rejected';
   var emailsFailed = results[1].status === 'rejected';
   var tasksFailed = results[2].status === 'rejected';
+  var doLaterFailed = results[3].status === 'rejected';
 
   if (statusFailed) {
     renderEngine(null);
@@ -196,19 +278,64 @@ async function loadAll() {
     var tk = results[2].value || {};
     tasks = tk.tasks || [];
   }
+  if (!doLaterFailed) {
+    var dl = results[3].value || {};
+    doLaterEmails = dl.emails || dl.do_later || [];
+    // Keep the doLater flag on the list copies in sync.
+    var dlIds = {};
+    doLaterEmails.forEach(function (e) { dlIds[e.id] = true; });
+    allEmails.forEach(function (e) { e.doLater = !!dlIds[e.id]; });
+  } else {
+    // Fall back to the flag on the email objects themselves.
+    doLaterEmails = allEmails.filter(function (e) { return e.doLater; });
+  }
   renderCounts();
   renderNeeds();
   renderFilters();
+  renderCollectionTabs();
   renderEmails();
   renderTasks();
+  renderDoLater();
 
-  if (statusFailed && emailsFailed && tasksFailed) {
+  if (urlErrorMsg) {
+    showError(urlErrorMsg);
+  } else if (statusFailed && emailsFailed && tasksFailed) {
     showError('Could not load the inbox: ' + results[0].reason.message);
   } else if (emailsFailed) {
     showError('Could not load emails: ' + results[1].reason.message);
   } else if (tasksFailed) {
     showError('Could not load tasks: ' + results[2].reason.message);
   }
+}
+
+/* First paint from the cached run (if /api/status reports one), then
+   refresh in the background: run the agents automatically so the
+   cached counts are replaced by a live run. */
+async function bootLoad() {
+  try {
+    var st = await api('/api/status');
+    renderEngine(st);
+    if (st && st.cachedRun) {
+      cachedRun = st.cachedRun;
+      if (cachedRun.counts) {
+        counts = cachedRun.counts;
+        renderCounts();
+        renderFilters();
+        renderCollectionTabs();
+      }
+      if (cachedRun.lastRunAt) {
+        $('lastRun').textContent = 'Last run: ' + fmtDateLong(cachedRun.lastRunAt);
+      }
+    }
+  } catch (e) {
+    renderEngine(null);
+  }
+  await loadAll();
+  loadSettings();
+  // Background refresh on every connected load: re-run the agents
+  // quietly, replacing the cached view (or filling an empty one when
+  // there is no cached run yet). Quiet failures stay silent.
+  runAgents({ quiet: true });
 }
 
 function renderEngine(st) {
@@ -219,17 +346,26 @@ function renderEngine(st) {
   var parts = [];
   if (st.engine) parts.push('Engine: ' + st.engine);
   if (st.note) parts.push(st.note);
+  if (st.scopeVersion) parts.push('Scope: ' + st.scopeVersion);
   $('engineLine').textContent = parts.join('  ·  ');
   if (st.last_run_seconds != null) {
     $('lastRun').textContent = 'Last run: ' + st.last_run_seconds + 's';
   }
+  if (st.cachedRun && st.cachedRun.lastRunAt) {
+    $('lastRun').textContent = 'Last run: ' + fmtDateLong(st.cachedRun.lastRunAt);
+  }
+  // Mark-as-read needs the current Gmail scope. If the token predates
+  // it, say so calmly and block nothing else.
+  needsReconnect = !!st.needsReconnect;
+  $('reconnectBanner').hidden = !needsReconnect;
 }
 
-async function runAgents() {
+async function runAgents(opts) {
+  opts = opts || {};
   var btn = $('runBtn');
   btn.disabled = true;
   btn.textContent = 'Running…';
-  hideError();
+  if (!opts.quiet) hideError();
   try {
     var res = await api('/api/run', { method: 'POST' });
     if (res && res.seconds != null) {
@@ -239,10 +375,10 @@ async function runAgents() {
     }
     await loadAll();
   } catch (e) {
-    showError('Run failed: ' + e.message);
+    if (!opts.quiet) showError('Run failed: ' + e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Run the agents';
+    btn.textContent = 'Organize now';
   }
 }
 
@@ -300,6 +436,36 @@ function renderFilters() {
   });
 }
 
+/* Collection tabs ("windows") combine with the triage filter above:
+   shown emails must match both. */
+function renderCollectionTabs() {
+  var box = $('collectionTabs');
+  if (!box) return;
+  box.innerHTML = '';
+  var mk = function (label, key) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'tab');
+    b.textContent = label;
+    if (currentCollection === key) b.className = 'active';
+    b.addEventListener('click', function () {
+      currentCollection = key;
+      renderCollectionTabs();
+      renderEmails();
+    });
+    box.appendChild(b);
+  };
+  mk('All collections', 'all');
+  COLLECTIONS.forEach(function (key) {
+    var n = allEmails.filter(function (e) { return e.collection === key; }).length;
+    mk(COL_LABELS[key] + ' (' + n + ')', key);
+  });
+}
+
+function collectionLabel(e) {
+  return COL_LABELS[e.collection] || (e.collection ? e.collection : 'Other');
+}
+
 /* ---------- needs you now ---------- */
 
 function renderNeeds() {
@@ -328,27 +494,132 @@ function renderNeeds() {
 function renderEmails() {
   var box = $('emailList');
   box.innerHTML = '';
+  // Deferred emails live in the Do later section, not in the main list.
   var list = allEmails
+    .filter(function (e) { return !e.doLater; })
     .filter(function (e) { return !currentFilter || e.category === currentFilter; })
+    .filter(function (e) { return currentCollection === 'all' || (e.collection || 'other') === currentCollection; })
     .sort(function (a, b) { return b.priority - a.priority; });
   if (!list.length) {
     box.innerHTML = '<p class="muted pad">' +
-      (currentFilter ? 'No emails in this category.' : 'No emails yet. Run the agents to triage your inbox.') +
+      ((currentFilter || currentCollection !== 'all') ? 'No emails match these filters.' : 'No emails yet. Organize now to triage your inbox.') +
       '</p>';
     return;
   }
   list.forEach(function (e) {
     var d = document.createElement('div');
+    d.className = 'row' + (e.id === selectedId ? ' selected' : '') + (e.read === false ? ' unread' : '');
+    d.innerHTML =
+      '<div><div class="sender">' + esc(e.from_name || '') + ' &lt;' + esc(e.from || '') + '&gt; · ' + esc(fmtDate(e.date)) + '</div>' +
+      '<div class="subject">' + esc(e.subject) + '</div></div>' +
+      '<span class="collection-tag">' + esc(collectionLabel(e)) + '</span>' +
+      '<span class="cat-label">' + esc(CAT_LABELS[e.category] || e.category) + '</span>' +
+      '<span class="prio' + (e.priority >= 4 ? ' high' : '') + '">P' + e.priority + '</span>' +
+      '<div class="reason">' + esc(e.triage_reason || '') + '</div>' +
+      '<div class="row-actions">' +
+      (e.read === false
+        ? '<button type="button" class="btn btn-secondary btn-small row-action" data-act="read">Mark as read</button>'
+        : '<button type="button" class="btn btn-secondary btn-small row-action" data-act="unread">Mark unread</button>') +
+      '<button type="button" class="btn btn-secondary btn-small row-action" data-act="later">Do later</button>' +
+      '</div>';
+    d.addEventListener('click', function () { openEmail(e.id); });
+    d.querySelectorAll('.row-action').forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var act = btn.getAttribute('data-act');
+        if (act === 'read') markAsRead(e.id, true);
+        else if (act === 'unread') markAsRead(e.id, false);
+        else if (act === 'later') toggleDoLater(e.id, true);
+      });
+    });
+    box.appendChild(d);
+  });
+}
+
+/* ---------- do later ---------- */
+
+function renderDoLater() {
+  var section = $('doLaterSection');
+  var box = $('doLaterList');
+  $('doLaterCount').textContent = doLaterEmails.length ? '(' + doLaterEmails.length + ')' : '';
+  box.innerHTML = '';
+  if (!doLaterEmails.length) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  doLaterEmails.forEach(function (e) {
+    var d = document.createElement('div');
     d.className = 'row' + (e.id === selectedId ? ' selected' : '');
     d.innerHTML =
       '<div><div class="sender">' + esc(e.from_name || '') + ' &lt;' + esc(e.from || '') + '&gt; · ' + esc(fmtDate(e.date)) + '</div>' +
       '<div class="subject">' + esc(e.subject) + '</div></div>' +
+      '<span class="collection-tag">' + esc(collectionLabel(e)) + '</span>' +
       '<span class="cat-label">' + esc(CAT_LABELS[e.category] || e.category) + '</span>' +
-      '<span class="prio' + (e.priority >= 4 ? ' high' : '') + '">P' + e.priority + '</span>' +
-      '<div class="reason">' + esc(e.triage_reason || '') + '</div>';
+      '<div class="row-actions">' +
+      '<button type="button" class="btn btn-secondary btn-small row-action" data-act="restore">Restore</button>' +
+      '</div>';
     d.addEventListener('click', function () { openEmail(e.id); });
+    d.querySelector('[data-act="restore"]').addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      toggleDoLater(e.id, false);
+    });
     box.appendChild(d);
   });
+}
+
+/* ---------- mark as read / do later ---------- */
+
+function handleReconnectError(err) {
+  if (err && (err.status === 409 || /reconnect/i.test(err.message || ''))) {
+    showError(RECONNECT_MSG);
+    return true;
+  }
+  return false;
+}
+
+async function markAsRead(id, read) {
+  try {
+    await api('/api/emails/' + encodeURIComponent(id) + '/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ read: !!read })
+    });
+    var listEmail = allEmails.find(function (x) { return x.id === id; });
+    if (listEmail) listEmail.read = !!read;
+    if (selectedEmail && selectedEmail.id === id) {
+      selectedEmail.read = !!read;
+      renderDetail(selectedEmail);
+    }
+    renderEmails();
+  } catch (err) {
+    if (!handleReconnectError(err)) showError('Mark as read failed: ' + err.message);
+  }
+}
+
+async function toggleDoLater(id, doLater) {
+  try {
+    await api('/api/emails/' + encodeURIComponent(id) + '/do-later', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ doLater: !!doLater })
+    });
+    var listEmail = allEmails.find(function (x) { return x.id === id; });
+    if (listEmail) listEmail.doLater = !!doLater;
+    if (selectedEmail && selectedEmail.id === id) {
+      selectedEmail.doLater = !!doLater;
+      renderDetail(selectedEmail);
+    }
+    if (doLater) {
+      if (listEmail && doLaterEmails.indexOf(listEmail) === -1) doLaterEmails.push(listEmail);
+    } else {
+      doLaterEmails = doLaterEmails.filter(function (x) { return x.id !== id; });
+    }
+    renderEmails();
+    renderDoLater();
+  } catch (err) {
+    if (!handleReconnectError(err)) showError('Do later failed: ' + err.message);
+  }
 }
 
 /* ---------- tasks ---------- */
@@ -379,8 +650,15 @@ function renderTasks() {
 async function openEmail(id) {
   selectedId = id;
   renderEmails();
+  renderDoLater();
   var pane = $('detailPane');
-  pane.innerHTML = '<p class="muted pad">Loading…</p>';
+  var content = $('detailContent');
+  content.innerHTML = '<p class="muted pad">Loading…</p>';
+  pane.classList.add('open');
+  $('detailBackBtn').hidden = false;
+  // Bring the detail into view: on desktop it is the sticky right
+  // column; on narrow screens it is a full overlay.
+  pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   try {
     var detail = await api('/api/emails/' + encodeURIComponent(id));
     selectedEmail = detail;
@@ -392,19 +670,37 @@ async function openEmail(id) {
       selectedEmail = local;
       renderDetail(local);
     } else {
-      pane.innerHTML = '<p class="muted pad">Could not load this email: ' + esc(e.message) + '</p>';
+      content.innerHTML = '<p class="muted pad">Could not load this email: ' + esc(e.message) + '</p>';
     }
   }
 }
 
+function closeDetail() {
+  $('detailPane').classList.remove('open');
+  $('detailBackBtn').hidden = true;
+}
+
 function renderDetail(e) {
   var pane = $('detailPane');
+  var content = $('detailContent');
   var html = '';
   html += '<h2>' + esc(e.subject) + '</h2>';
   html += '<p class="d-meta">' + esc(e.from_name || '') + ' &lt;' + esc(e.from || '') + '&gt; · ' + esc(fmtDateLong(e.date)) +
-    ' · <span class="cat-label">' + esc(CAT_LABELS[e.category] || e.category) + '</span> · P' + e.priority + '</p>';
+    ' · <span class="cat-label">' + esc(CAT_LABELS[e.category] || e.category) + '</span> · P' + e.priority +
+    ' · <span class="collection-tag">' + esc(collectionLabel(e)) + '</span></p>';
+  html += '<div class="detail-actions">' +
+    '<button type="button" class="btn btn-secondary btn-small" id="detailReadBtn">' +
+    (e.read === false ? 'Mark as read' : 'Mark as unread') + '</button>' +
+    '<button type="button" class="btn btn-secondary btn-small" id="detailLaterBtn">' +
+    (e.doLater ? 'Remove from Do later' : 'Do later') + '</button>' +
+    '</div>';
   html += '<h3>Original email</h3>';
-  html += '<div class="body-text">' + esc(e.body || '') + '</div>';
+  if (e.bodyHtml) {
+    // bodyHtml arrives sanitized from the backend; render as HTML.
+    html += '<div class="body-html">' + e.bodyHtml + '</div>';
+  } else {
+    html += '<div class="body-text">' + esc(e.bodyText != null ? e.bodyText : (e.body || '')) + '</div>';
+  }
   html += '<h3>Triage</h3>';
   html += '<p class="reason-line"><b>Category:</b> ' + esc(CAT_LABELS[e.category] || e.category) + ' — ' + esc(e.triage_reason || '') + '</p>';
   html += '<p class="reason-line"><b>Priority:</b> P' + e.priority + ' — ' + esc(e.priority_reason || '') + '</p>';
@@ -429,7 +725,15 @@ function renderDetail(e) {
   } else {
     html += '<p class="reason-line">No draft — ' + esc(e.draft_reason || 'no reply needed for this email.') + '</p>';
   }
-  pane.innerHTML = html;
+  content.innerHTML = html;
+  pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  $('detailReadBtn').addEventListener('click', function () {
+    markAsRead(e.id, e.read !== false ? false : true);
+  });
+  $('detailLaterBtn').addEventListener('click', function () {
+    toggleDoLater(e.id, !e.doLater);
+  });
 
   if (!e.draft) return;
 
@@ -577,6 +881,24 @@ function askSendConfirm(e) {
 
 var DEFAULT_HOURS = ['09:00'];
 
+/* Fill hour slots up to `freq` from the spread defaults, so a new slot
+   never duplicates an existing hour. */
+function padHours(hours, freq) {
+  hours = (hours || []).slice(0, freq);
+  for (var i = hours.length; i < freq; i++) {
+    var candidate = SPREAD_HOURS[i] || '09:00';
+    // If the spread value is already taken, nudge forward an hour.
+    var tries = 0;
+    while (hours.indexOf(candidate) !== -1 && tries < 24) {
+      var parts = candidate.split(':');
+      candidate = ('0' + ((parseInt(parts[0], 10) + 1) % 24)).slice(-2) + ':' + parts[1];
+      tries++;
+    }
+    hours.push(candidate);
+  }
+  return hours;
+}
+
 function renderHours(hours) {
   var box = $('remHours');
   box.innerHTML = '';
@@ -610,8 +932,7 @@ function applySettings(s) {
   if (!Array.isArray(hours) || !hours.length) {
     hours = DEFAULT_HOURS.slice();
   }
-  while (hours.length < freq) hours.push('09:00');
-  hours = hours.slice(0, freq);
+  hours = padHours(hours, freq);
   $('remFrequency').value = String(freq);
   $('remEnabled').checked = s.enabled !== false;
   $('remTimezone').value = s.timezone || 'Asia/Kolkata';
@@ -635,11 +956,27 @@ async function saveSettings(ev) {
   ev.preventDefault();
   var btn = $('saveSettingsBtn');
   var statusEl = $('settingsStatus');
+  // frequency is a real integer: the select options carry numeric
+  // values "1".."5", parsed here — never "2 per day".
   var freq = parseInt($('remFrequency').value, 10) || 1;
+  freq = Math.min(5, Math.max(1, freq));
+  var hours = collectHours().slice(0, freq);
+  // Client-side validation: reminder hours must be distinct.
+  var seen = {};
+  var dup = null;
+  hours.forEach(function (h) {
+    if (seen[h]) dup = h;
+    seen[h] = true;
+  });
+  if (dup) {
+    statusEl.textContent = 'Reminder hours must be different — ' + dup + ' is used twice. Change one of them and save again.';
+    statusEl.className = 'form-status err';
+    return;
+  }
   var payload = {
     enabled: $('remEnabled').checked,
-    frequency_per_day: freq,
-    hours: collectHours().slice(0, freq),
+    frequency: freq,
+    hours: hours,
     timezone: $('remTimezone').value.trim() || 'Asia/Kolkata'
   };
   btn.disabled = true;
@@ -665,25 +1002,51 @@ async function saveSettings(ev) {
   }
 }
 
+async function sendTestReminder() {
+  var btn = $('testReminderBtn');
+  var statusEl = $('settingsStatus');
+  btn.disabled = true;
+  statusEl.textContent = 'Sending test reminder…';
+  statusEl.className = 'form-status muted';
+  try {
+    await api('/api/reminders/test', { method: 'POST' });
+    statusEl.textContent = 'Test reminder sent — check your inbox.';
+    statusEl.className = 'form-status ok';
+  } catch (e) {
+    statusEl.textContent = e.message || 'Test reminder failed.';
+    statusEl.className = 'form-status err';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 /* ---------- boot ---------- */
 
 function init() {
+  initTheme();
   readTokenFromUrl();
+  readErrorFromUrl();
   renderAuth();
 
+  $('themeToggle').addEventListener('click', toggleTheme);
+  $('detailBackBtn').addEventListener('click', closeDetail);
   $('retryBtn').addEventListener('click', function () {
+    urlErrorMsg = '';
     hideError();
     if (!token) { showConnectState(); return; }
     loadAll();
   });
-  $('dismissErrorBtn').addEventListener('click', hideError);
-  $('runBtn').addEventListener('click', runAgents);
+  $('dismissErrorBtn').addEventListener('click', function () {
+    urlErrorMsg = '';
+    hideError();
+  });
+  $('runBtn').addEventListener('click', function () { runAgents(); });
   $('settingsForm').addEventListener('submit', saveSettings);
+  $('testReminderBtn').addEventListener('click', sendTestReminder);
   $('remFrequency').addEventListener('change', function () {
     var freq = parseInt($('remFrequency').value, 10) || 1;
-    var hours = collectHours();
-    while (hours.length < freq) hours.push('09:00');
-    renderHours(hours.slice(0, freq));
+    var hours = padHours(collectHours(), freq);
+    renderHours(hours);
   });
 
   if (!token) {
@@ -691,8 +1054,8 @@ function init() {
     return;
   }
   showDashboard();
-  loadAll();
-  loadSettings();
+  renderCollectionTabs();
+  bootLoad();
 }
 
 document.addEventListener('DOMContentLoaded', init);
