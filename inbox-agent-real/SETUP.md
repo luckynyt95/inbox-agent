@@ -169,3 +169,32 @@ verification switch only.
   fallback locally.
 - The GitHub Actions workflow run — YAML written, not run (needs the repo
   + live site URL).
+
+## v2 changes (13 Nov 2026) — read before redeploying
+
+- **OAuth scope is now `gmail.modify` ONLY** (supersedes `gmail.readonly` +
+  `gmail.send`; verified against Google's scopes docs). The app requests
+  only `https://www.googleapis.com/auth/gmail.modify`. Before the v2
+  deploy works for mark-as-read, add that scope to the consent screen:
+  Cloud Console → project "Inbox Agent" → APIs & Services → Google Auth
+  platform → Data Access → Add or remove scopes → tick `gmail.modify`
+  (or paste it in "Manually add scopes") → Update → Save.
+- **Every existing user must reconnect once** for the new scope: in the
+  app, Disconnect, then Connect Gmail again (the app shows "Reconnect to
+  enable mark-as-read" until then). Read/send keep working on the old
+  token; only mark-as-read needs the new one. Testing-mode refresh
+  tokens expire after 7 days, so reconnect is weekly regardless.
+- **Other Gmails:** Testing mode only allows listed test users (max 100).
+  To let another Gmail sign in, add it first: Google Auth platform →
+  Audience → Test users → Add users. Anyone not listed gets
+  `access_denied` at the consent screen; the app now surfaces Google's
+  error text instead of a blank banner.
+- **Settings bug fixed:** the save payload is now `{enabled, frequency,
+  hours, timezone}` with `frequency` a real integer; the backend accepts
+  the old `frequency_per_day` name too. Reminder hours must be distinct.
+- **Email bodies** are now sanitized HTML (`bodyHtml`) with a plain-text
+  fallback (`bodyText`); raw HTML source is never shown.
+- **Reminders:** the hourly sweep also refreshes the cached triage, and
+  Settings has a "Send test reminder" button.
+- Full v2 notes: see the parent agent's delivery message for this build
+  (root causes, verification, hosting options in HOSTING.md).
