@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inbox Agent</title>
+<link rel="icon" href="logo.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <img src="logo.svg" class="logo" alt="" width="30" height="30">
+      <div class="wordmark">Inbox Agent</div>
+    </div>
+    <div class="topbar-right">
+      <button type="button" class="btn btn-secondary btn-small" id="themeToggle" aria-label="Toggle dark mode">Dark mode</button>
+      <div class="auth" id="authArea">
+        <!-- Filled by app.js: Connect button, or email + Disconnect -->
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+  <div class="errorbar" id="errorBar" hidden>
+    <span id="errorText"></span>
+    <button type="button" id="retryBtn">Retry</button>
+    <button type="button" id="dismissErrorBtn" class="linklike">Dismiss</button>
+  </div>
+
+  <!-- Shown when there is no session token -->
+  <section class="connect-panel" id="connectPanel" hidden>
+    <h1>Connect Gmail to start</h1>
+    <p>Inbox Agent reads your mail, sorts it into Urgent, Action, FYI, Promo and Spam, drafts replies for the ones that need one, and pulls out tasks with due dates. Nothing is sent without your approval.</p>
+    <a class="btn btn-primary" href="/api/auth/start" id="connectBtn">Connect Gmail</a>
+    <p class="fineprint">Sign-in runs through Google. The app only reads mail and sends replies you approve.</p>
+  </section>
+
+  <!-- Shown once signed in -->
+  <div id="dashboard" hidden>
+    <div class="reconnect-banner" id="reconnectBanner" hidden>Reconnect to enable mark-as-read — Disconnect, then Connect Gmail again.</div>
+    <section class="counts" id="counts" aria-label="Inbox counts"></section>
+
+    <div class="runrow">
+      <button type="button" class="btn btn-primary" id="runBtn">Organize now</button>
+      <span class="runmeta" id="lastRun">Last run: —</span>
+      <span class="runmeta" id="engineLine">Engine: —</span>
+    </div>
+
+    <div class="shell">
+      <aside class="sidebar">
+        <section class="panel" aria-label="Needs you now">
+          <h2 class="panel-label">Needs you now</h2>
+          <div id="needsList"><p class="muted">Loading…</p></div>
+        </section>
+
+        <section class="panel" aria-label="Tasks">
+          <h2 class="panel-label">Tasks <span class="panel-count" id="taskCount"></span></h2>
+          <div id="taskList"><p class="muted">Loading…</p></div>
+        </section>
+
+        <section class="panel" aria-label="Reminder settings">
+          <h2 class="panel-label">Reminders</h2>
+          <p class="panel-note">A short email with your urgent count and tasks due, sent at the hours you choose.</p>
+          <form id="settingsForm">
+            <label class="field">
+              <span class="field-label">Enabled</span>
+              <input type="checkbox" id="remEnabled">
+            </label>
+            <label class="field">
+              <span class="field-label">Reminders per day</span>
+              <select id="remFrequency">
+                <option value="1">1 per day</option>
+                <option value="2">2 per day</option>
+                <option value="3">3 per day</option>
+                <option value="4">4 per day</option>
+                <option value="5">5 per day</option>
+              </select>
+            </label>
+            <div class="field">
+              <span class="field-label">Send at</span>
+              <div id="remHours"></div>
+            </div>
+            <label class="field">
+              <span class="field-label">Timezone</span>
+              <input type="text" id="remTimezone" value="Asia/Kolkata" autocomplete="off">
+            </label>
+            <button type="submit" class="btn btn-secondary" id="saveSettingsBtn">Save settings</button>
+            <button type="button" class="btn btn-secondary" id="testReminderBtn">Send test reminder</button>
+            <p class="form-status muted" id="settingsStatus"></p>
+          </form>
+        </section>
+      </aside>
+
+      <section class="maincol">
+        <div class="filters" id="filters" role="tablist" aria-label="Filter inbox"></div>
+        <div class="collection-tabs" id="collectionTabs" role="tablist" aria-label="Filter by collection"></div>
+        <div class="inbox-shell">
+          <div class="list" id="emailList"><p class="muted pad">Loading…</p></div>
+          <section class="detail" id="detailPane" aria-label="Email detail">
+            <button type="button" class="btn btn-secondary btn-small detail-back" id="detailBackBtn" hidden>Back to list</button>
+            <div id="detailContent"><p class="muted pad">Select an email to read it.</p></div>
+          </section>
+        </div>
+        <section class="panel do-later" id="doLaterSection" aria-label="Do later" hidden>
+          <h2 class="panel-label">Do later <span class="panel-count" id="doLaterCount"></span></h2>
+          <div id="doLaterList"></div>
+        </section>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
