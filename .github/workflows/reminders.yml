@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # TODO: replace with your Netlify site URL (no trailing slash)
-      SITE_URL: "https://inbox-agent-app.netlify.app"
+      SITE_URL: "https://inbox-agent-app.vercel.app"
     steps:
       - name: Trigger reminder sweep
         run: |
