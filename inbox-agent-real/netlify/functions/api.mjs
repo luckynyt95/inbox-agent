@@ -5,8 +5,12 @@
 //
 // The engine (triage / priority / draft / task / pipeline) and the 20 seed
 // emails below are copied VERBATIM from the verified prototype
-// (~/workspace/inbox-agent-netlify/netlify/functions/api.mjs). The seed
-// data is used ONLY by the mock Gmail fetcher (MOCK_GMAIL=true, local
+// (~/workspace/inbox-agent-netlify/netlify/functions/api.mjs) — EXCEPT the
+// Draft Agent's trigger groups, tightened 13 Nov 2026 (see the
+// ANTI-FABRICATION RULE above DRAFT_TEMPLATES): the bare "sign" trigger
+// attached a vendor-agreement reply to real security-alert / activation /
+// verification emails. Triage, priority and task logic remain verbatim.
+// The seed data is used ONLY by the mock Gmail fetcher (MOCK_GMAIL=true, local
 // verification); the real app runs the engine on the user's Gmail messages
 // fetched via OAuth + the Gmail API.
 //
@@ -155,13 +159,21 @@ function parseDeadline(email) {
 // of one group appear as whole words. ("website","down") means the
 // website must actually be down, not just mentioned (E04's bill says
 // "pay on our app or website" — that is NOT an outage.)
+//
+// ANTI-FABRICATION RULE (fixed 13 Nov 2026): every template below asserts
+// specific facts (a date, an amount, a name, a site), so its trigger group
+// must include those facts. A bare word like "sign" used to match ANY
+// email containing "sign in" — security alerts, account activations,
+// email verifications — and attach a vendor-agreement reply that was
+// wrong for all of them. If no group matches, draft() returns null and
+// the UI shows "no draft" instead of a made-up reply.
 const DRAFT_TEMPLATES = [
-  [[["rescheduled"]], "Hi,\n\nThanks for the update. Confirming I will attend the rescheduled interview tomorrow, 13 Nov, at 10:00 AM, and I will carry my resume and ID card.\n\nThanks,\nRonnie"],
-  [[["approve"]], "Hi,\n\nApproved — your leave from 14 to 16 Nov is fine. Thanks for sorting the handover.\n\nThanks,\nRonnie"],
-  [[["confirm your order"]], "Hi,\n\nConfirming the order of 50 steel brackets. Please go ahead with cutting.\n\nThanks,\nRonnie"],
-  [[["sign"]], "Hi,\n\nI have signed the vendor agreement and will send the signed copy back by 15 Nov 2026.\n\nThanks,\nRonnie"],
-  [[["website", "down"], ["outage"]], "Hi team,\n\nOur website shopdemo.in appears to be down since 2 AM and customers cannot place orders. Could you please share an ETA for fixing it?\n\nThanks,\nRonnie"],
-  [[["semester fee"]], "Hi,\n\nI will pay the semester fee of Rs 48,500 by 15 Nov 2026 through the fee portal. Please confirm once it is received.\n\nThanks,\nRonnie"],
+  [[["rescheduled", "interview", "13 nov", "10:00"]], "Hi,\n\nThanks for the update. Confirming I will attend the rescheduled interview tomorrow, 13 Nov, at 10:00 AM, and I will carry my resume and ID card.\n\nThanks,\nRonnie"],
+  [[["approve", "leave", "16 nov"]], "Hi,\n\nApproved — your leave from 14 to 16 Nov is fine. Thanks for sorting the handover.\n\nThanks,\nRonnie"],
+  [[["confirm your order", "steel brackets"]], "Hi,\n\nConfirming the order of 50 steel brackets. Please go ahead with cutting.\n\nThanks,\nRonnie"],
+  [[["sign", "vendor agreement", "15 nov"]], "Hi,\n\nI have signed the vendor agreement and will send the signed copy back by 15 Nov 2026.\n\nThanks,\nRonnie"],
+  [[["website", "down", "shopdemo.in", "2 am"], ["outage", "shopdemo.in"]], "Hi team,\n\nOur website shopdemo.in appears to be down since 2 AM and customers cannot place orders. Could you please share an ETA for fixing it?\n\nThanks,\nRonnie"],
+  [[["semester fee", "48,500", "15 nov"]], "Hi,\n\nI will pay the semester fee of Rs 48,500 by 15 Nov 2026 through the fee portal. Please confirm once it is received.\n\nThanks,\nRonnie"],
 ];
 
 // Agent 3 — write a short reply draft, or null if no reply is needed.
