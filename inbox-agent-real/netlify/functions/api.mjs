@@ -423,7 +423,8 @@ const SCOPE_VERSION = 2;
 const OAUTH_SCOPES = "https://www.googleapis.com/auth/gmail.modify";
 //
 // STORAGE — Netlify Blobs, store "inbox-agent":
-//   oauth-state:<token>      short-lived CSRF state (10 min)
+//   oauth-state:<token>      short-lived CSRF state (30 min TTL, see
+//                             OAUTH_STATE_TTL_MS below)
 //   user:<googleUserId>      {id, email, refreshToken, createdAt}
 //   session:<token>          {userId, createdAt}
 //   users:index              [userId, ...] (for the hourly reminder sweep)
@@ -451,6 +452,15 @@ const STORE_NAME = "inbox-agent";
 const OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1";
+
+// CSRF state TTL: 30 minutes. Google's round-trip is slow when phone
+// verification is involved (tap Yes + a number on the phone), and a
+// 10-minute TTL expired on real users (13 Nov 2026, twice: once after
+// ~1 hour, once while switching accounts) even though the flow was
+// legitimate — the user landed on "state mismatch" with no recourse.
+// 30 minutes still bounds replay risk: the state is single-use
+// (deleted on first callback) and unguessable (2 UUIDs).
+const OAUTH_STATE_TTL_MS = 30 * 60 * 1000;
 
 const isMock = () => process.env.MOCK_GMAIL === "true";
 
@@ -585,12 +595,23 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
-function htmlResponse(title, message, status = 400) {
+// Auth failure page: plain-words explanation + a one-click retry that
+// starts a FRESH OAuth flow (GET /api/auth/start). The old page was a
+// dead end — "Invalid or expired sign-in attempt (state mismatch)" with
+// only a back link — so users whose sign-in simply timed out (slow
+// phone check) had no idea what happened or how to recover. Every auth
+// failure now says, in plain words, that nothing is wrong with the
+// Google account and offers the retry.
+function authErrorResponse(title, message, status = 400) {
   return new Response(
     `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
-      `<body style="font-family:sans-serif;max-width:560px;margin:40px auto">` +
-      `<h1>${title}</h1><p>${message}</p>` +
-      `<p><a href="/">Back to Inbox Agent</a></p></body>`,
+      `<body style="font-family:sans-serif;background:#f7f7f5;color:#1c1c1a;margin:0">` +
+      `<main style="max-width:560px;margin:80px auto;padding:32px;background:#fff;border:1px solid #e5e5e0;border-radius:12px">` +
+      `<h1 style="font-size:24px;margin:0 0 12px">${title}</h1>` +
+      `<p style="line-height:1.6;margin:0 0 24px">${message}</p>` +
+      `<a href="/api/auth/start" style="display:inline-block;background:#2f6b4f;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Try connecting again</a> ` +
+      `<a href="/" style="display:inline-block;margin-left:12px;color:#2f6b4f">Back to Inbox Agent</a>` +
+      `</main></body>`,
     { status, headers: { "Content-Type": "text/html; charset=utf-8" } },
   );
 }
@@ -1284,8 +1305,31 @@ export default async (req) => {
       return jsonResponse({ detail: "Google OAuth is not configured on this site (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET missing)." }, 500);
     }
     const redirectUri = siteUrl(req) + "/api/auth/callback";
+    // Each start mints its own state key — a second Connect click (or a
+    // second tab) does NOT invalidate the first: the callback accepts
+    // any stored, unexpired state once, then consumes it. So double-start
+    // is safe by construction; the fix for slow round-trips is the
+    // 30-minute TTL, not single-state reuse (reusing one state would
+    // make the second tab's callback fail after the first consumed it).
     const state = randomToken();
+    // The state MUST be durably recorded before we redirect to Google:
+    // if the write is lost, the callback can never validate it and the
+    // user lands on a "state mismatch" dead end. Write, then read back;
+    // retry once; if it still isn't there, fail here with a retry button
+    // instead of sending the user to Google on a doomed flow.
     await storeSetJSON(`oauth-state:${state}`, { createdAt: Date.now() });
+    let recorded = await storeGetJSON(`oauth-state:${state}`);
+    if (!recorded) {
+      await storeSetJSON(`oauth-state:${state}`, { createdAt: Date.now() });
+      recorded = await storeGetJSON(`oauth-state:${state}`);
+    }
+    if (!recorded) {
+      return authErrorResponse(
+        "Google sign-in failed",
+        "The sign-in could not be started because the security check could not be saved. Nothing is wrong with your Google account — please try again.",
+        500,
+      );
+    }
     const authUrl = new URL(OAUTH_AUTH_URL);
     authUrl.search = new URLSearchParams({
       client_id: process.env.GOOGLE_CLIENT_ID,
@@ -1316,22 +1360,38 @@ export default async (req) => {
       });
     }
     if (!code || !state) {
-      return htmlResponse("Google sign-in failed", "Missing code or state in the callback. Please try connecting again.", 400);
+      return authErrorResponse(
+        "Google sign-in failed",
+        "The sign-in reply from Google was incomplete (missing code or state). Nothing is wrong with your Google account — please try again.",
+      );
     }
     const saved = await storeGetJSON(`oauth-state:${state}`);
+    if (!saved) {
+      // Unknown state: already consumed (e.g. this link was already
+      // used), or the attempt was started too long ago. Either way the
+      // fix is the same — start a fresh flow.
+      return authErrorResponse(
+        "Google sign-in failed",
+        "This sign-in link is no longer valid — it may already have been used, or the attempt was started too long ago. Nothing is wrong with your Google account — please try again.",
+      );
+    }
+    // Single-use: consume the state now, before the code exchange.
     await store.delete(`oauth-state:${state}`);
-    if (!saved || Date.now() - saved.createdAt > 10 * 60 * 1000) {
-      return htmlResponse("Google sign-in failed", "Invalid or expired sign-in attempt (state mismatch). Please try connecting again.", 400);
+    if (Date.now() - saved.createdAt > OAUTH_STATE_TTL_MS) {
+      return authErrorResponse(
+        "Google sign-in failed",
+        "This sign-in attempt timed out — it took longer than 30 minutes (for example, the phone check took a while). Nothing is wrong with your Google account — please try again.",
+      );
     }
     const redirectUri = siteUrl(req) + "/api/auth/callback";
     let tokens;
     try {
       tokens = await exchangeCode(code, redirectUri);
     } catch (e) {
-      return htmlResponse("Google sign-in failed", `Could not exchange the sign-in code: ${e.message}. Please try connecting again.`, 400);
+      return authErrorResponse("Google sign-in failed", `Could not exchange the sign-in code: ${e.message}. Nothing is wrong with your Google account — please try again.`);
     }
     if (!tokens.refresh_token) {
-      return htmlResponse("Google sign-in failed", "Google did not return a refresh token. Please disconnect the app in your Google account and try again (offline access is required).", 400);
+      return authErrorResponse("Google sign-in failed", "Google did not return a refresh token. Please disconnect the app in your Google account and try again (offline access is required).");
     }
     // Identify the user: Gmail profile first, OpenID userinfo as fallback.
     let googleId = null;
@@ -1358,7 +1418,7 @@ export default async (req) => {
       }
     }
     if (!googleId || !email) {
-      return htmlResponse("Google sign-in failed", "Signed in, but the account email could not be read. Please try connecting again.", 400);
+      return authErrorResponse("Google sign-in failed", "Signed in, but the account email could not be read. Nothing is wrong with your Google account — please try again.");
     }
     const user = { id: googleId, email, refreshToken: tokens.refresh_token, createdAt: Date.now(), scopeVersion: SCOPE_VERSION };
     await storeSetJSON(`user:${user.id}`, user);
