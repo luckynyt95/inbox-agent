@@ -475,9 +475,21 @@ function randomToken() {
 }
 
 // --- Blobs wrapper -------------------------------------------------------
-// getStore() throws outside the Netlify functions runtime (e.g. plain
-// `node` locally), so every op falls back to an in-memory store with the
-// same get/set/delete/list shape. On Netlify the real store is used.
+// ROOT CAUSE (fixed 13 Nov 2026 — "Session expired" seconds after a
+// successful Google sign-in): the old wrapper silently fell back to a
+// module-level in-memory Map whenever getStore() threw
+// (MissingBlobsEnvironmentError when the Blobs context is absent) or any
+// real-store op failed. A session written on one function instance was
+// then invisible to every other instance, so the callback's redirect
+// handed the browser a token that existed only in the callback
+// instance's memory — the very next API call 401'd, and the
+// pre-existing connection died on every deploy / instance recycle.
+// The fix: in production the real store is mandatory. If it is
+// unavailable, operations throw loudly (and the cause is logged to the
+// function logs) instead of creating sessions that can never be read
+// back. The memory fallback survives ONLY in mock mode
+// (MOCK_GMAIL=true), where there is no Netlify runtime and local
+// verification needs it.
 const _memoryStores = new Map();
 function _memoryStore(name) {
   if (!_memoryStores.has(name)) _memoryStores.set(name, new Map());
@@ -497,7 +509,51 @@ function _memoryStore(name) {
   };
 }
 
-function blobStore(name) {
+// Resolve the real Netlify Blobs store. Throws loudly (and logs the cause
+// once per instance) when the Blobs context is missing. Success is
+// cached; failure is NOT cached — getStore is a cheap synchronous
+// constructor, and a transient failure must not poison the instance.
+let _realStore = null;
+let _realStoreErrorLogged = false;
+function resolveRealStore() {
+  if (_realStore) return _realStore;
+  try {
+    _realStore = getStore(STORE_NAME);
+    return _realStore;
+  } catch (e) {
+    if (!_realStoreErrorLogged) {
+      _realStoreErrorLogged = true;
+      console.error("[inbox-agent] Netlify Blobs unavailable:", e?.name, e?.message);
+    }
+    throw new Error(
+      `Blobs store unavailable (${e?.name || "unknown"}: ${e?.message || "no detail"})`,
+    );
+  }
+}
+
+// Production store: real Blobs only. Any failure is logged and rethrown —
+// never silently served from per-instance memory.
+function realBackedStore() {
+  const run = async (label, key, fn) => {
+    const r = resolveRealStore();
+    try {
+      return await fn(r);
+    } catch (e) {
+      console.error("[inbox-agent] Blobs op failed:", label, key, e?.name, e?.message);
+      throw e;
+    }
+  };
+  return {
+    get: (key) => run("get", key, (r) => r.get(key)),
+    set: (key, value) => run("set", key, (r) => r.set(key, value)),
+    delete: (key) => run("delete", key, (r) => r.delete(key)),
+    list: (opts) => run("list", opts?.prefix || "", (r) => r.list(opts)),
+  };
+}
+
+// Local verification only (MOCK_GMAIL=true): try the real store first,
+// fall back to the in-memory store when there is no Netlify runtime.
+function memoryBackedStore(name) {
   let real = null;
   let tried = false;
   const getReal = () => {
@@ -561,6 +617,10 @@ function blobStore(name) {
       return mem.list(opts);
     },
   };
+}
+
+function blobStore(name) {
+  return isMock() ? memoryBackedStore(name) : realBackedStore();
 }
 
 const store = blobStore(STORE_NAME);
@@ -1291,7 +1351,7 @@ function isKnownPath(path) {
   );
 }
 
-export default async (req) => {
+async function handleRequest(req) {
   const url = new URL(req.url);
   let path = url.pathname;
   if (path.length > 1 && path.endsWith("/")) {
@@ -1317,11 +1377,23 @@ export default async (req) => {
     // user lands on a "state mismatch" dead end. Write, then read back;
     // retry once; if it still isn't there, fail here with a retry button
     // instead of sending the user to Google on a doomed flow.
-    await storeSetJSON(`oauth-state:${state}`, { createdAt: Date.now() });
-    let recorded = await storeGetJSON(`oauth-state:${state}`);
-    if (!recorded) {
+    // The state MUST be durably recorded before we redirect to Google:
+    // the callback compares the returned state against this record (and
+    // against the in-memory copy). In production a store failure now
+    // throws instead of silently landing in per-instance memory, so a
+    // failure here fails the flow with a retry button — never a redirect
+    // to Google on a doomed flow.
+    let recorded = null;
+    try {
       await storeSetJSON(`oauth-state:${state}`, { createdAt: Date.now() });
       recorded = await storeGetJSON(`oauth-state:${state}`);
+      if (!recorded) {
+        await storeSetJSON(`oauth-state:${state}`, { createdAt: Date.now() });
+        recorded = await storeGetJSON(`oauth-state:${state}`);
+      }
+    } catch (e) {
+      console.error("[inbox-agent] could not save OAuth state:", e?.message);
+      recorded = null;
     }
     if (!recorded) {
       return authErrorResponse(
@@ -1421,10 +1493,45 @@ export default async (req) => {
       return authErrorResponse("Google sign-in failed", "Signed in, but the account email could not be read. Nothing is wrong with your Google account — please try again.");
     }
     const user = { id: googleId, email, refreshToken: tokens.refresh_token, createdAt: Date.now(), scopeVersion: SCOPE_VERSION };
-    await storeSetJSON(`user:${user.id}`, user);
-    await addUserToIndex(user.id);
-    const sessionToken = randomToken();
-    await storeSetJSON(`session:${sessionToken}`, { userId: user.id, createdAt: Date.now() });
+    let sessionToken;
+    try {
+      await storeSetJSON(`user:${user.id}`, user);
+      await addUserToIndex(user.id);
+      sessionToken = randomToken();
+      await storeSetJSON(`session:${sessionToken}`, { userId: user.id, createdAt: Date.now() });
+      // The session MUST be readable back from the persistent store before
+      // we hand the token to the browser: if the write did not persist,
+      // the very next API call would 401 with a fake "Session expired"
+      // (that was the 13 Nov bug). Retry once, then fail here with a
+      // retry button instead of redirecting with a doomed token.
+      const sessionPersisted = async () => {
+        try {
+          const back = await storeGetJSON(`session:${sessionToken}`);
+          return back?.userId === user.id;
+        } catch {
+          return false;
+        }
+      };
+      let persisted = await sessionPersisted();
+      if (!persisted) {
+        await new Promise((r) => setTimeout(r, 500));
+        persisted = await sessionPersisted();
+      }
+      if (!persisted) {
+        return authErrorResponse(
+          "Google sign-in failed",
+          "The sign-in could not be saved — the session did not persist. Nothing is wrong with your Google account — please try again.",
+          500,
+        );
+      }
+    } catch (e) {
+      console.error("[inbox-agent] could not save session:", e?.message);
+      return authErrorResponse(
+        "Google sign-in failed",
+        `The sign-in could not be saved: ${e.message}. Nothing is wrong with your Google account — please try again.`,
+        500,
+      );
+    }
     // Session token travels as a query param (plus the account email, so
     // the frontend can show it immediately); the frontend saves the token
     // to localStorage and sends it as Authorization: Bearer on every call.
@@ -1862,6 +1969,21 @@ export default async (req) => {
     return jsonResponse({ detail: "Method Not Allowed" }, 405);
   }
   return jsonResponse({ detail: "Not Found" }, 404);
+}
+
+// Thin wrapper so a store outage (or any other unexpected throw) surfaces
+// as a JSON 500 with a clear detail — and is logged — instead of an
+// unhandled rejection. Expected failures still return their own responses.
+export default async (req) => {
+  try {
+    return await handleRequest(req);
+  } catch (e) {
+    console.error("[inbox-agent] request failed:", e?.name, e?.message);
+    return jsonResponse(
+      { detail: `Server error — please try again. (${e?.message || "unknown error"})` },
+      500,
+    );
+  }
 };
 
 export const config = { path: "/api/*" };
