@@ -1,0 +1,34 @@
+# Inbox Agent — hourly reminder sweep
+# Runs POST /api/remind on the Netlify site once an hour. The endpoint
+# itself decides, per user, whether the current hour matches one of their
+# chosen reminder hours (and skips users already reminded that hour), so
+# it is safe to call hourly.
+#
+# SETUP:
+#   1. Replace SITE_URL below with your real Netlify URL, e.g.
+#      https://inbox-agent-real.netlify.app
+#      (or set a repo variable/secret named SITE_URL and use it instead).
+#   2. Add a repo secret named REMIND_SECRET with the same value as the
+#      REMIND_SECRET environment variable on the Netlify site.
+#   3. Put this file at .github/workflows/reminders.yml in your repo.
+
+name: Inbox Agent reminders
+
+on:
+  schedule:
+    - cron: "0 * * * *" # every hour, on the hour
+  workflow_dispatch: # allow a manual run from the Actions tab
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    env:
+      # TODO: replace with your Netlify site URL (no trailing slash)
+      SITE_URL: "https://REPLACE-WITH-YOUR-NETLIFY-URL.netlify.app"
+    steps:
+      - name: Trigger reminder sweep
+        run: |
+          curl -sS -X POST "$SITE_URL/api/remind" \
+            -H "X-Remind-Secret: ${{ secrets.REMIND_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{}'
