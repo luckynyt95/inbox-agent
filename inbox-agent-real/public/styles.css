@@ -3,6 +3,11 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* The `hidden` attribute must win over any author `display` rule below
+   (e.g. .errorbar sets display:flex). Without this, a hidden element
+   still renders — that was the empty red banner on first load. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #ffffff;
   --surface: #f7f7f5;

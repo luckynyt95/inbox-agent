@@ -48,6 +48,9 @@ function fmtDateLong(iso) {
 }
 
 function showError(msg) {
+  // Never render an empty banner: a real failure always gets a message.
+  msg = String(msg == null ? '' : msg).trim();
+  if (!msg) msg = 'Something went wrong. Please try again.';
   $('errorText').textContent = msg;
   $('errorBar').hidden = false;
 }
@@ -122,6 +125,7 @@ async function disconnect() {
   tasks = [];
   selectedId = null;
   selectedEmail = null;
+  hideError();
   renderAuth();
   showConnectState();
 }
@@ -668,6 +672,7 @@ function init() {
   renderAuth();
 
   $('retryBtn').addEventListener('click', function () {
+    hideError();
     if (!token) { showConnectState(); return; }
     loadAll();
   });
