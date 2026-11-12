@@ -1,0 +1,17 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  # Bundle the seeded data and the static dir into the function artifact.
+  # (The function folder itself is bundled; these entries cover the
+  # data file and static assets the app reads at runtime.)
+  included_files = [
+    "netlify/functions/api/data/**",
+    "netlify/functions/api/static/**",
+  ]
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
