@@ -1087,9 +1087,90 @@ async function gmailApi(accessToken, path, options = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data?.error?.message || `Gmail API ${path} failed (${res.status})`);
+    // Preserve the HTTP status and Google's error reason: the retry
+    // logic (and the frontend's plain-words message) must be able to
+    // tell a rate-limit 429/403 from an auth/permissions failure.
+    // Previously this threw new Error(message) and discarded both.
+    const err = new Error(data?.error?.message || `Gmail API ${path} failed (${res.status})`);
+    err.status = res.status;
+    err.reason = data?.error?.errors?.[0]?.reason || null;
+    err.gmailPath = path;
+    throw err;
   }
   return data;
+}
+
+// --- Gmail quota retry -----------------------------------------------------
+// QUOTA FIX (13 Nov 2026): one Organize run costs 1x messages.list
+// (5 units) + 50x messages.get format=full (60 each) = 3,005 units,
+// inside Google's 6,000 units/min/user/project limit (verified against
+// https://developers.google.com/workspace/gmail/api/reference/quota).
+// A single run fits; the first-load failure was a duplicate-run race
+// (up to four overlapping runs = 6,010+ units), fixed by the
+// single-flight dedupe below. This retry is the second layer: a single
+// Gmail call that still hits the limit is retried on its own, so a
+// transient 429 does not fail the whole run and already-fetched
+// messages are never re-fetched (fetchInbox keeps its progress).
+//
+// Retry ONLY: HTTP 429, or HTTP 403 with reason rateLimitExceeded /
+// userRateLimitExceeded, or a message matching the quota/rate-limit
+// pattern. Other 4xx (auth, permissions, not-found) are never retried.
+// Backoff: truncated exponential with jitter, base delays ~5s, 15s,
+// 30s, 60s, max 5 attempts per call. Worst case ≈ 110s waiting + run
+// time, inside Vercel's 300s function timeout. Delays are overridable
+// via GMAIL_RETRY_DELAYS_MS (comma-separated ms, e.g. "10,20,30,40")
+// for local mock verification only; unset in production.
+const GMAIL_RETRY_BASE_DELAYS_MS = [5000, 15000, 30000, 60000];
+const GMAIL_MAX_ATTEMPTS = 5;
+
+function gmailRetryDelays() {
+  const raw = process.env.GMAIL_RETRY_DELAYS_MS;
+  if (raw) {
+    const parsed = raw
+      .split(",")
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    if (parsed.length) return parsed;
+  }
+  return GMAIL_RETRY_BASE_DELAYS_MS;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableGmailError(e) {
+  if (!e) return false;
+  if (e.status === 429) return true;
+  if (
+    e.status === 403 &&
+    (e.reason === "rateLimitExceeded" || e.reason === "userRateLimitExceeded")
+  ) {
+    return true;
+  }
+  return /quota exceeded|rate.?limit|userRateLimit/i.test(e.message || "");
+}
+
+// Retry one Gmail call (not the whole run). Deliberately NOT used for
+// sends (messages.send / drafts.send are not idempotent — a retry
+// could send twice); only fetchInbox calls this.
+async function gmailApiWithRetry(accessToken, path, options = {}) {
+  const delays = gmailRetryDelays();
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await gmailApi(accessToken, path, options);
+    } catch (e) {
+      attempt += 1;
+      if (!isRetryableGmailError(e) || attempt >= GMAIL_MAX_ATTEMPTS) throw e;
+      const base = delays[Math.min(attempt - 1, delays.length - 1)] ?? 60000;
+      const wait = base + Math.floor(Math.random() * 1000);
+      console.warn(
+        `[inbox-agent] Gmail quota hit on ${path} (attempt ${attempt}/${GMAIL_MAX_ATTEMPTS}, status ${e.status}, reason ${e.reason || "?"}); retrying in ~${Math.round(wait / 1000)}s`,
+      );
+      await sleep(wait);
+    }
+  }
 }
 
 // Returns [{email, meta}, ...] — the engine shape plus reply metadata.
@@ -1098,14 +1179,16 @@ async function fetchInbox(user) {
     return EMAILS.map((e) => parseGmailMessage(mockGmailMessage(e)));
   }
   const accessToken = await refreshAccessToken(user.refreshToken);
-  const list = await gmailApi(
+  const list = await gmailApiWithRetry(
     accessToken,
     `/users/me/messages?maxResults=50&q=${encodeURIComponent("in:inbox")}`,
   );
   const messages = list.messages || [];
   const out = [];
   for (const m of messages) {
-    const full = await gmailApi(
+    // Retried per message: a quota hit on message N does not discard
+    // the messages already fetched above it.
+    const full = await gmailApiWithRetry(
       accessToken,
       `/users/me/messages/${encodeURIComponent(m.id)}?format=full`,
     );
@@ -1115,8 +1198,39 @@ async function fetchInbox(user) {
 }
 
 // --- Pipeline run + per-user state -------------------------------------------
+//
+// DEDUPE DESIGN (quota fix, 13 Nov 2026) — two layers, no Blob lock:
+//   1. In-process single-flight: concurrent runPipelineForUser() calls
+//      for the same user in one function instance share one promise.
+//      Waiters get the same result (or the same clean failure); the
+//      entry is removed when the run settles, so a failed run never
+//      poisons later calls and nothing can hang forever.
+//   2. Read endpoints never fetch: /api/emails, /api/tasks,
+//      /api/do-later and the email-detail route return the stored run
+//      (or empty) via ensureRun() below. /api/run (plus the reminder
+//      sweep / test, which call runPipelineForUser directly) is the
+//      only fetch trigger. A Blob lock was rejected: Blob put/get has
+//      no atomic compare-and-swap, so two instances could both see
+//      "no lock" and both fetch — the race this fix exists to kill.
+//      With reads not fetching, the only remaining duplicates are
+//      two /api/run calls landing on different instances at the same
+//      instant; each is a single 3,005-unit run, inside the limit,
+//      and the second overwrites the first with an identical result.
+const _inflightRuns = new Map();
 
 async function runPipelineForUser(user) {
+  const inFlight = _inflightRuns.get(user.id);
+  if (inFlight) return inFlight;
+  const run = doRunPipelineForUser(user);
+  _inflightRuns.set(user.id, run);
+  try {
+    return await run;
+  } finally {
+    if (_inflightRuns.get(user.id) === run) _inflightRuns.delete(user.id);
+  }
+}
+
+async function doRunPipelineForUser(user) {
   const start = Date.now();
   const fetched = await fetchInbox(user);
   const emails = fetched.map((f) => f.email);
@@ -1146,9 +1260,13 @@ async function getStoredRun(userId) {
 }
 
 async function ensureRun(user) {
-  const stored = await getStoredRun(user.id);
-  if (stored) return stored;
-  return runPipelineForUser(user);
+  // Stored run only — NEVER starts a Gmail fetch. Read endpoints
+  // (/api/emails, /api/tasks, /api/do-later, email detail) call this,
+  // so a first page load that fires them in parallel cannot start
+  // overlapping runs. Returns null when no run exists yet; callers
+  // answer with an empty view and the frontend's bootLoad() triggers
+  // the one fetch via /api/run (see public/app.js).
+  return getStoredRun(user.id);
 }
 
 async function getDraftState(userId) {
@@ -1763,6 +1881,12 @@ async function handleRequest(req) {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
+    if (!result) {
+      return jsonResponse({
+        emails: [],
+        counts: { urgent: 0, action: 0, fyi: 0, promo: 0, spam: 0 },
+      });
+    }
     let emails = await enrichEmails(result, auth.userId);
     const category = url.searchParams.get("category") || "";
     if (category) emails = emails.filter((r) => r.category === category);
@@ -1782,6 +1906,7 @@ async function handleRequest(req) {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
+    if (!result) return jsonResponse({ detail: "No organized inbox yet — run Organize first." }, 404);
     const id = decodeURIComponent(emailMatch[1]);
     const found = (await enrichEmails(result, auth.userId)).find((r) => r.id === id);
     if (!found) return jsonResponse({ detail: "email not found" }, 404);
@@ -1871,6 +1996,7 @@ async function handleRequest(req) {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
+    if (!result) return jsonResponse({ emails: [], count: 0 });
     const emails = (await enrichEmails(result, auth.userId)).filter((r) => r.doLater);
     return jsonResponse({ emails, count: emails.length });
   }
@@ -1885,6 +2011,7 @@ async function handleRequest(req) {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
+    if (!result) return jsonResponse({ tasks: [], count: 0 });
     return jsonResponse({ tasks: result.tasks, count: result.tasks.length });
   }
 
@@ -1946,6 +2073,7 @@ async function handleRequest(req) {
     } catch (e) {
       return jsonResponse({ detail: `Gmail fetch failed: ${e.message}` }, 502);
     }
+    if (!result) return jsonResponse({ detail: "No organized inbox yet — run Organize first." }, 404);
     const found = result.results.find((r) => r.id === id);
     if (!found) return jsonResponse({ detail: "email not found" }, 404);
     const draftText = draftState.editedDrafts[id] || found.draft;
@@ -2117,4 +2245,12 @@ export {
   SCOPE_VERSION,
   OAUTH_SCOPES,
   store as __testStore,
+  // Quota-fix verification hooks (mock Gmail tests only): fetchInbox
+  // takes a stubbed global fetch, runPipelineForUser exercises the
+  // single-flight dedupe, isRetryableGmailError / gmailApiWithRetry
+  // exercise the retry predicate and per-call retry.
+  fetchInbox,
+  runPipelineForUser,
+  isRetryableGmailError,
+  gmailApiWithRetry,
 };
