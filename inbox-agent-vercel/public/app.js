@@ -309,8 +309,11 @@ async function loadAll() {
 }
 
 /* First paint from the cached run (if /api/status reports one), then
-   refresh in the background: run the agents automatically so the
-   cached counts are replaced by a live run. */
+   refresh in the background ONLY when there is no cached run yet:
+   returning users already have an organized inbox, and a background
+   re-run on every load was one of the overlapping fetches that blew
+   the Gmail quota on first load. The Organize button stays the manual
+   trigger for a fresh run. */
 async function bootLoad() {
   try {
     var st = await api('/api/status');
@@ -332,10 +335,9 @@ async function bootLoad() {
   }
   await loadAll();
   loadSettings();
-  // Background refresh on every connected load: re-run the agents
-  // quietly, replacing the cached view (or filling an empty one when
-  // there is no cached run yet). Quiet failures stay silent.
-  runAgents({ quiet: true });
+  // Background refresh only when there is no cached run to show yet
+  // (first-ever load). Quiet failures stay silent.
+  if (!cachedRun) runAgents({ quiet: true });
 }
 
 function renderEngine(st) {
@@ -360,6 +362,17 @@ function renderEngine(st) {
   $('reconnectBanner').hidden = !needsReconnect;
 }
 
+/* Plain-words message for Gmail quota/rate-limit failures. The raw
+   Gmail API text ("Rate Limit Exceeded", "User Rate Limit Exceeded",
+   429/403 details) must never reach the banner: it says nothing
+   useful to the user, and a failed run never loses anything — the
+   last good organized inbox is still on screen. */
+var QUOTA_MSG = 'Gmail is busy right now (rate limit). Showing your last organized inbox — nothing was lost. Try Organize again in a minute.';
+
+function isQuotaError(e) {
+  return !!e && /quota|rate.?limit|userRateLimit|429/i.test(e.message || '');
+}
+
 async function runAgents(opts) {
   opts = opts || {};
   var btn = $('runBtn');
@@ -375,7 +388,9 @@ async function runAgents(opts) {
     }
     await loadAll();
   } catch (e) {
-    if (!opts.quiet) showError('Run failed: ' + e.message);
+    // A failed run leaves the last good counts/emails on screen
+    // (nothing here clears them); only the message changes.
+    if (!opts.quiet) showError(isQuotaError(e) ? QUOTA_MSG : 'Run failed: ' + e.message);
   } finally {
     btn.disabled = false;
     btn.textContent = 'Organize now';
@@ -1034,7 +1049,11 @@ function init() {
     urlErrorMsg = '';
     hideError();
     if (!token) { showConnectState(); return; }
-    loadAll();
+    // Retry re-runs the failed Organize (runAgents' success path
+    // already reloads the cached view via loadAll). The old handler
+    // only called loadAll(), which re-read the same stale/empty cache
+    // and could never fix a failed run.
+    runAgents();
   });
   $('dismissErrorBtn').addEventListener('click', function () {
     urlErrorMsg = '';
